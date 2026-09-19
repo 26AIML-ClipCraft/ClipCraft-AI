@@ -14,13 +14,18 @@ import torch
 import json
 import numpy as np
 from tqdm import tqdm
-from vtimellm.model.builder import load_pretrained_model
-from vtimellm.utils import disable_torch_init
-from vtimellm.inference import inference
-from vtimellm.model.adapter.tensor_utils import pad_sequences_1d
-from vtimellm.eval.similarity import _topk_pooling
-from vtimellm.uncertainty.funs_get_feature_X import get_entropy_statistics
+from revisionllm.model.builder import load_pretrained_model
+from revisionllm.utils import disable_torch_init
+from revisionllm.inference import inference
+from revisionllm.model.adapter.tensor_utils import pad_sequences_1d
+from revisionllm.eval.similarity import _topk_pooling
+from revisionllm.uncertainty.funs_get_feature_X import get_entropy_statistics
+from revisionllm.eval.audio_utils import AudioStore, apply_drop_flags
 random.seed(42)
+
+
+def str2bool(v):
+    return str(v).lower() in ('1', 'true', 'yes', 'y')
 try:
     from torchvision.transforms import InterpolationMode
     BICUBIC = InterpolationMode.BICUBIC
@@ -73,6 +78,20 @@ def parse_args():
     parser.add_argument("--skip_small_videos", type=bool, default=True)
     parser.add_argument("--baseline", type=bool, default=False)
     parser.add_argument("--plus_baseline", type=bool, default=False)
+    # ---- ClipCraft audio branch ----
+    parser.add_argument("--audio_fusion", type=str2bool, default=False)
+    parser.add_argument("--audio_feat_folder", type=str, default=None, help="LMDB of CLAP features (1 s hop)")
+    parser.add_argument("--audio_dim", type=int, default=512)
+    parser.add_argument("--audio_hop_sec", type=float, default=1.0)
+    parser.add_argument("--audio_gate_init", type=float, default=0.0)
+    parser.add_argument("--audio_dropout", type=float, default=0.0)
+    parser.add_argument("--pretrain_audio_fusion", type=str, default=None)
+    parser.add_argument("--drop_visual", type=str2bool, default=False, help="ablation R3: zero visual features")
+    parser.add_argument("--drop_audio", type=str2bool, default=False, help="ablation R4: zero audio features")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa")
+    parser.add_argument("--video_ids", type=str, default=None, help="optional JSON list of video ids (Test-sub)")
+    parser.add_argument("--dense_iteration_step", type=int, default=None,
+                        help="set 1 to run an 'alternate'-trained stage2 model on its dense/temporal path (odd step)")
     args = parser.parse_args()
     return args
 
@@ -153,6 +172,10 @@ def eval(args):
     if args.q_feat_dir is not None:
         textual_env = lmdb.open(args.q_feat_dir, readonly=True, create=False, max_readers=4096 * 8, readahead=False)
         textual_txn = textual_env.begin(buffers=True)
+    # ClipCraft: CLAP features aligned per sliding window.
+    audio_store = AudioStore(args.audio_feat_folder if args.audio_fusion else None,
+                             audio_dim=args.audio_dim, hop_sec=args.audio_hop_sec, feature_fps=args.feature_fps)
+    keep_video_ids = set(json.load(open(args.video_ids))) if args.video_ids is not None else None
     errors=[]
     logs = []
     if os.path.exists(prediction_path):
@@ -190,6 +213,8 @@ def eval(args):
         try:
             movie = data['movie'] if 'movie' in data else data['clip_id']
             movie = data['query_id'] if 'val_frame' in args.feat_folder else movie
+            if keep_video_ids is not None and movie not in keep_video_ids:
+                continue
             if args.vis_feat_storage == 'lmdb':  # because chapters data is enormous I use npy directly for now
                 dump = appearance_visual_txn.get(movie.encode())
                 with io.BytesIO(dump) as reader:
@@ -198,6 +223,10 @@ def eval(args):
             else:
                 path = os.path.join(args.feat_folder, movie + '.npy')
                 features = np.load(path)
+            audio_full = audio_store.get(movie) if audio_store.enabled else None
+            # Row index of every stored frame; kept in sync with any resampling below
+            # so audio can be aligned to whatever frames finally reach the model.
+            frame_rows = np.arange(features.shape[0])
 
             query_feats = None
             query_cls_feats = None
@@ -216,10 +245,12 @@ def eval(args):
                 else:
                     sampled_indices = np.linspace(0, features.shape[0]-1, args.num_frames, dtype=np.int32)
                     features = features[sampled_indices]
+                    frame_rows = frame_rows[sampled_indices]
 
             if args.baseline:
                 sampled_indices = np.linspace(0, features.shape[0]-1, int(args.debug_window * args.feature_fps), dtype=np.int32)
                 features = features[sampled_indices]
+                frame_rows = frame_rows[sampled_indices]
 
             ctx_l = len(features)
             assert ctx_l > 0, ctx_l
@@ -227,19 +258,25 @@ def eval(args):
             num_window = math.ceil(ctx_l / (clip_length//2)) - 1
             windowidx = [1] if args.baseline else list(range(num_window))
             clip_feats = []
+            clip_audios = []
             for i in windowidx:
                 start = max(i * clip_length//2, 0)
                 end = min(i * clip_length//2 + clip_length, ctx_l-1)
                 sampled_indices = np.linspace(start, end, args.num_frames, dtype=np.int32)
                 clip_feat = features[sampled_indices]
                 clip_feats.append(clip_feat)
+                if audio_store.enabled:
+                    clip_audios.append(audio_store.align(audio_full, frame_rows[sampled_indices]))
 
             if args.plus_baseline:
                 sampled_indices = np.linspace(0, features.shape[0]-1, args.num_frames, dtype=np.int32)
                 clip_feat = features[sampled_indices]
                 clip_feats.append(clip_feat)
+                if audio_store.enabled:
+                    clip_audios.append(audio_store.align(audio_full, frame_rows[sampled_indices]))
 
             features = torch.from_numpy(np.array(clip_feats))
+            audio_windows = torch.from_numpy(np.array(clip_audios, dtype=np.float32)) if audio_store.enabled else None
             timestamps = data['timestamps']#[data['timestamps'][0] - start_s, data['timestamps'][1] - start_s]
             if args.q_feat_dir is not None:
                 query_feats = torch.from_numpy(query_feats)
@@ -255,8 +292,9 @@ def eval(args):
                 if args.q_feat_dir is not None:
                     query_feats = query_feats.to(torch.float32)
                     query_cls_feats = query_cls_feats.to(torch.float32)
-            # if args.q_feat_dir is not None:
-            #     query_feats = pad_sequences_1d(query_feats[None,].repeat(features.shape[0],1,1), dtype=query_feats.dtype, device=query_feats.device, fixed_length=None)
+            if audio_windows is not None:
+                audio_windows = audio_windows.to(dtype=features.dtype, device=features.device)
+            features, audio_windows = apply_drop_flags(features, audio_windows, args.drop_visual, args.drop_audio)
 
             if features is None:
                 print(f'Can not find video {movie}')
@@ -282,9 +320,10 @@ def eval(args):
                     start = i * batch
                     end = min(start + batch, features.shape[0])
                     feat = features[start:end]
+                    aud = audio_windows[start:end] if audio_windows is not None else None
                     if args.q_feat_dir is not None:# and i==0:
                         query_feats_temp = pad_sequences_1d(query_feats[None,].repeat(feat.shape[0],1,1), dtype=query_feats.dtype, device=query_feats.device, fixed_length=None)
-                    answer, model_output = inference(model, feat, query_feats_temp, "<video>\n" + query.format(sentence), tokenizer, return_list=True)
+                    answer, model_output = inference(model, feat, query_feats_temp, "<video>\n" + query.format(sentence), tokenizer, return_list=True, audio_feats=aud, iteration_step=args.dense_iteration_step)
                     # print("answer: ", answer)
                     # for a in answer:
                     answers.extend(answer)

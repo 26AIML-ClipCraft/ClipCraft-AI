@@ -35,25 +35,22 @@ def parse_args():
                         default="/data/chapters/chapters_vmr_test.jsonl")
     parser.add_argument("--activitynet_data_path", type=str, default="/data/stage2.json")
     parser.add_argument("--chapters_out_path", type=str, default="/data/chapters/chapters_test.json")
+    parser.add_argument("--ids", type=str, default=None, help="optional JSON list of video ids to keep (Test-sub / Val-sub)")
     args = parser.parse_args()
     return args
 
 
-def convert_ego_to_vtimellm(ego_data):
+def convert_ego_to_vtimellm(ego_data, keep_ids=None):
     #{"1050": {"movie": "3003_40_YEAR_OLD_VIRGIN",
              # "sentence": "He enters a store called Smart Tech carrying his front bicycle tire and bag.",
              # "timestamps": [162.547, 175.809], "ext_timestamps": [162.547, 175.809],
              # "movie_duration": 7947.6
     ego_to_activity = {}
-    path = f'/data/chapters/test.json'
-    with open(path) as f:
-        test_vodeos = json.load(f)
     for first_dict in ego_data:
+        if keep_ids is not None and first_dict['vid'] not in keep_ids:
+            continue
         second_dict = {}
-        for tv in test_vodeos:
-            if tv in first_dict['vid']:
-                second_dict['movie'] = tv
-                break
+        second_dict['movie'] = first_dict['vid']   # ClipCraft: LMDB key == YouTube id
         second_dict['sentence'] = first_dict['query']
         second_dict['timestamps'] = first_dict['relevant_windows'][0]
         second_dict['movie_duration'] = first_dict['duration']
@@ -72,6 +69,8 @@ if __name__ == "__main__":
             chapters_data = [json.loads(line) for line in f]
     else:
         chapters_data = json.load(open(args.chapters_data_path))['videos']
-    chapters_to_activity = convert_ego_to_vtimellm(chapters_data)
+    keep_ids = set(json.load(open(args.ids))) if args.ids is not None else None
+    chapters_to_activity = convert_ego_to_vtimellm(chapters_data, keep_ids=keep_ids)
+    print(f"{len(chapters_to_activity)} queries written to {args.chapters_out_path}")
     with open(args.chapters_out_path, 'w') as f:
         json.dump(chapters_to_activity, f)

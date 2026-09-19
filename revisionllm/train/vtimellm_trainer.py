@@ -12,9 +12,10 @@ from revisionllm.constants import PREFIX
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+    # ClipCraft: deepspeed import only when a ZeRO-3 partitioned param is seen.
     if hasattr(param, "ds_id"):
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
         if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if not ignore_status:
                 print(name, 'no ignore status')
@@ -64,6 +65,40 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     return to_return
 
 class VTimeLLMTrainer(Trainer):
+    def create_optimizer(self):
+        """
+        ClipCraft: same AdamW as HF Trainer, but ``audio_fusion.*`` params get
+        ``learning_rate * audio_lr_multiplier`` (the visually-converged model
+        sends little gradient into a zero-initialised branch). The HF LR
+        scheduler scales every group by the same lambda, so warmup/cosine are
+        preserved per group.
+        """
+        if self.optimizer is not None:
+            return self.optimizer
+        opt_model = self.model
+        mult = float(getattr(self.args, 'audio_lr_multiplier', 1.0) or 1.0)
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+        groups = []
+        for is_audio in (False, True):
+            for use_decay in (True, False):
+                params = [p for n, p in opt_model.named_parameters()
+                          if p.requires_grad
+                          and (('audio_fusion' in n) == is_audio)
+                          and ((n in decay_parameters) == use_decay)]
+                if not params:
+                    continue
+                groups.append({
+                    'params': params,
+                    'weight_decay': self.args.weight_decay if use_decay else 0.0,
+                    'lr': self.args.learning_rate * (mult if is_audio else 1.0),
+                })
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        optimizer_kwargs.pop('lr', None)  # per-group lr above
+        self.optimizer = optimizer_cls(groups, lr=self.args.learning_rate, **optimizer_kwargs)
+        n_audio = sum(p.numel() for g in groups if g['lr'] != self.args.learning_rate for p in g['params'])
+        print(f"[VTimeLLMTrainer] optimizer groups={len(groups)}, audio params={n_audio}, audio lr x{mult}")
+        return self.optimizer
+
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.

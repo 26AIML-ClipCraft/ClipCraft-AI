@@ -4,13 +4,37 @@ from revisionllm.constants import IMAGE_TOKEN_INDEX, IGNORE_INDEX, MEMORY_TOKEN_
 from abc import ABC, abstractmethod
 # from revisionllm.model.adapter.cross_attn import MLP, CrossAttn
 from revisionllm.model.adapter.transformer import ClipEncoder, PositionEmbeddingSine
+from revisionllm.model.adapter.audio_fusion import AudioFusion, load_audio_fusion_weights
 from einops import rearrange
 
 
 class VTimeLLMMetaModel:
 
+    def initialize_audio_modules(self, model_args):
+        """
+        ClipCraft: optional CLAP audio branch fused additively into the raw CLIP
+        frame features *before* any projector (linear mm_projector, ClipEncoder
+        adapter, hierarchy CLS pooling). Guarded with ``hasattr`` so that a
+        second call (train.py calls initialize_* twice) never resets weights
+        that ``load_lora`` already loaded from ``non_lora_trainables.bin``.
+        """
+        if not getattr(model_args, 'audio_fusion', False):
+            return
+        if hasattr(self, 'audio_fusion'):
+            return
+        self.audio_fusion = AudioFusion(
+            audio_dim=getattr(model_args, 'audio_dim', 512),
+            visual_dim=getattr(model_args, 'adapter_input_dim', 768),
+            gate_init=getattr(model_args, 'audio_gate_init', 0.0),
+            dropout=getattr(model_args, 'audio_dropout', 0.0),
+        )
+        pretrain = getattr(model_args, 'pretrain_audio_fusion', None)
+        if pretrain is not None:
+            load_audio_fusion_weights(self.audio_fusion, pretrain)
+
     def initialize_vision_modules(self, model_args):
         assert not model_args.clip_adapter or not model_args.cross_attn, "both clip_adapter and cross_attn cannot be true"
+        self.initialize_audio_modules(model_args)
         self.pretrain_clip_adapter = model_args.pretrain_clip_adapter
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
         self.clip_adapter = model_args.clip_adapter
@@ -49,7 +73,9 @@ class VTimeLLMMetaModel:
                     self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'), strict=False)
                     print("load mlp:", pretrain_mm_mlp_adapter)
 
-        if model_args.cross_attn:
+        # ClipCraft: guard so a second initialize_vision_modules() call does not
+        # re-create cross_attn and discard weights loaded by load_lora().
+        if model_args.cross_attn and not hasattr(self, 'cross_attn'):
             self.cross_attn = ClipEncoder(hidden_size=self.config.hidden_size,
                                           clip_adapter_text=model_args.clip_adapter_text,
                                           cross_attn=model_args.cross_attn and model_args.pretrain_clip_adapter is None,
@@ -69,7 +95,7 @@ class VTimeLLMMetaModel:
 
                 self.cross_attn.load_state_dict(get_wc(mm_projector_weights, 'mm_projector'), strict=False)
                 print("load clip adapter:", model_args.pretrain_clip_adapter)
-        if model_args.clip_adapter_feature == 'alternate':
+        if model_args.clip_adapter_feature == 'alternate' and not hasattr(self, 'alternate_layer_norm'):
             self.alternate_layer_norm = nn.LayerNorm(self.config.hidden_size)
 
 class VTimeLLMMetaForCausalLM(ABC):
@@ -78,8 +104,25 @@ class VTimeLLMMetaForCausalLM(ABC):
     def get_model(self):
         pass
 
+    def fuse_audio(self, images, audio_feats):
+        """
+        ClipCraft: additive audio fusion on raw CLIP features. Identity when the
+        model has no audio branch or no audio was provided. Handles the
+        list-of-tensors batch form used by the collator for ragged batches.
+        """
+        model = self.get_model()
+        if audio_feats is None or not hasattr(model, 'audio_fusion'):
+            return images
+        fusion = model.audio_fusion
+        if type(images) is list:
+            if type(audio_feats) is not list or len(audio_feats) != len(images):
+                raise ValueError("fuse_audio: images is a list but audio_feats is not a matching list")
+            return [fusion(im, au) for im, au in zip(images, audio_feats)]
+        return fusion(images, audio_feats)
+
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, position_ids, attention_mask, past_key_values, labels, images, query_feats, visual_memory, prefix_memory,iteration_step
+        self, input_ids, position_ids, attention_mask, past_key_values, labels, images, query_feats, visual_memory, prefix_memory,iteration_step,
+        audio_feats=None,
     ):
         # print(position_ids, attention_mask)
         # if past_key_values:
@@ -98,6 +141,11 @@ class VTimeLLMMetaForCausalLM(ABC):
                 )), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
+
+        # ClipCraft: fuse audio into the raw frame features. Every downstream
+        # path (linear projector, ClipEncoder, hierarchy CLS) then sees the
+        # audio-augmented features with unchanged tensor shapes.
+        images = self.fuse_audio(images, audio_feats)
 
         if type(images) is list:
             # for image in images:

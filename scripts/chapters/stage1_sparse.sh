@@ -70,7 +70,7 @@ deepspeed --master_port $MASTER_PORT revisionllm/train/train_mem.py \
     --neg_window True \
     --neg_samples 1 \
     --neg_factor 1 \
-    --feature_fps 5 \
+    --feature_fps 2 \
     --adapter_input_dim 768 \
     --clip_adapter True \
     --clip_adapter_text True \

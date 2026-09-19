@@ -53,6 +53,7 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         return_dict: Optional[bool] = None,
         start_end_frame: Optional[torch.tensor] = None,
         iteration_step: Optional[torch.tensor] = None,
+        audio_feats: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
             (
@@ -73,7 +74,8 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
                 [qf.to(torch.float32) for qf in query_feats] if query_feats is not None and self.device.type == 'cpu' else query_feats,
                 visual_memory.to(torch.float32) if self.device.type == 'cpu' and visual_memory is not None else visual_memory,
                 prefix_memory,#.to(torch.float32) if self.device.type == 'cpu' and prefix_memory is not None else prefix_memory
-                iteration_step
+                iteration_step,
+                audio_feats=(audio_feats.to(torch.float32) if self.device.type == 'cpu' and torch.is_tensor(audio_feats) else audio_feats),
             )
 
         return super().forward(
@@ -94,6 +96,8 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         query_feats = kwargs.pop("query_feats", None)
         visual_memory = kwargs.pop("visual_memory", None)
         prefix_memory = kwargs.pop("prefix_memory", None)
+        audio_feats = kwargs.pop("audio_feats", None)
+        iteration_step = kwargs.pop("iteration_step", None)
         kwargs.pop("cache_position", None)
 
         _inputs = super().prepare_inputs_for_generation(
@@ -101,6 +105,8 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         )
         if images is not None:
             _inputs['images'] = images
+        if audio_feats is not None:
+            _inputs['audio_feats'] = audio_feats
         if query_feats is not None:
             _inputs['query_feats'] = query_feats
         if visual_memory is not None:

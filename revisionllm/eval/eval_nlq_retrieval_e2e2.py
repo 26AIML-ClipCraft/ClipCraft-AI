@@ -21,9 +21,14 @@ from revisionllm.inference import inference
 from revisionllm.model.adapter.tensor_utils import pad_sequences_1d
 from revisionllm.eval.similarity import _topk_pooling
 from revisionllm.uncertainty.funs_get_feature_X import get_entropy_statistics
+from revisionllm.eval.audio_utils import AudioStore, to_model_tensor, apply_drop_flags
 
 
 random.seed(42)
+
+
+def str2bool(v):
+    return str(v).lower() in ('1', 'true', 'yes', 'y')
 try:
     from torchvision.transforms import InterpolationMode
     BICUBIC = InterpolationMode.BICUBIC
@@ -81,6 +86,18 @@ def parse_args():
     parser.add_argument("--grounding_path", type=str, default=None)
     parser.add_argument("--distributed_retrieval", type=int, default=16)
     parser.add_argument("--stride", type=int, default=5)
+    # ---- ClipCraft audio branch ----
+    parser.add_argument("--audio_fusion", type=str2bool, default=False)
+    parser.add_argument("--audio_feat_folder", type=str, default=None, help="LMDB of CLAP features (1 s hop)")
+    parser.add_argument("--audio_dim", type=int, default=512)
+    parser.add_argument("--audio_hop_sec", type=float, default=1.0)
+    parser.add_argument("--audio_gate_init", type=float, default=0.0)
+    parser.add_argument("--audio_dropout", type=float, default=0.0)
+    parser.add_argument("--pretrain_audio_fusion", type=str, default=None)
+    parser.add_argument("--drop_visual", type=str2bool, default=False, help="ablation R3: zero visual features")
+    parser.add_argument("--drop_audio", type=str2bool, default=False, help="ablation R4: zero audio features")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa")
+    parser.add_argument("--video_ids", type=str, default=None, help="optional JSON list of video ids (Test-sub) to restrict evaluation to")
     args = parser.parse_args()
     return args
 
@@ -190,6 +207,12 @@ def eval(args):
     if args.q_feat_dir is not None:
         textual_env = lmdb.open(args.q_feat_dir, readonly=True, create=False, max_readers=4096 * 8, readahead=False)
         textual_txn = textual_env.begin(buffers=True)
+    # ClipCraft: CLAP features, aligned per window exactly like the training loader.
+    audio_store = AudioStore(args.audio_feat_folder if args.audio_fusion else None,
+                             audio_dim=args.audio_dim, hop_sec=args.audio_hop_sec, feature_fps=args.feature_fps)
+    keep_video_ids = None
+    if args.video_ids is not None:
+        keep_video_ids = set(json.load(open(args.video_ids)))
     errors=[]
     logs = []
     if os.path.exists(prediction_path):
@@ -236,6 +259,8 @@ def eval(args):
             continue
         try:
             movie = data['movie'] if 'movie' in data else data['clip_id']
+            if keep_video_ids is not None and movie not in keep_video_ids:
+                continue
             if args.vis_feat_storage == 'lmdb':  # because chapters data is enormous I use npy directly for now
                 dump = appearance_visual_txn.get(movie.encode())
                 with io.BytesIO(dump) as reader:
@@ -244,6 +269,7 @@ def eval(args):
             else:
                 path = os.path.join(args.feat_folder, movie + '.npy')
                 features = np.load(path)
+            audio_full = audio_store.get(movie) if audio_store.enabled else None
 
             query_feats = None
             query_cls_feats = None
@@ -265,6 +291,7 @@ def eval(args):
             num_window = math.ceil(ctx_l / (clip_length//args.stride)) - 1
             windowidx = list(range(num_window))
             clip_feats = []
+            clip_audios = []
             times = []
             for i in windowidx:
                 start = max(i * clip_length//args.stride, 0)
@@ -275,6 +302,8 @@ def eval(args):
                 sampled_indices = np.linspace(start, end, args.num_frames, dtype=np.int32)
                 clip_feat = features[sampled_indices]
                 clip_feats.append(clip_feat)
+                if audio_store.enabled:
+                    clip_audios.append(audio_store.align(audio_full, sampled_indices))
             if id in grounding_dict:
                 grounding_windows = []
                 grounding_windows_0 = [i for i, a in enumerate(grounding_dict[id]['answer']) if a != 'Not Present']
@@ -290,10 +319,15 @@ def eval(args):
                     grounding_windows = grounding_windows + non_grounding_windows
                     grounding_windows.sort()
                 clip_feats = [clip_feats[i] for i in grounding_windows]
+                if audio_store.enabled:
+                    clip_audios = [clip_audios[i] for i in grounding_windows]
             else:
                 grounding_windows = list(range(len(clip_feats)))
 
             features = torch.from_numpy(np.array(clip_feats))
+            audio_windows = None
+            if audio_store.enabled:
+                audio_windows = torch.from_numpy(np.array(clip_audios, dtype=np.float32))  # (W, T, Da)
             timestamps = data['timestamps']#[data['timestamps'][0] - start_s, data['timestamps'][1] - start_s]
             if args.q_feat_dir is not None:
                 query_feats = torch.from_numpy(query_feats)
@@ -309,6 +343,9 @@ def eval(args):
                 if args.q_feat_dir is not None:
                     query_feats = query_feats.to(torch.float32)
                     query_cls_feats = query_cls_feats.to(torch.float32)
+            if audio_windows is not None:
+                audio_windows = audio_windows.to(dtype=features.dtype, device=features.device)
+            features, audio_windows = apply_drop_flags(features, audio_windows, args.drop_visual, args.drop_audio)
 
             if features is None:
                 print(f'Can not find video {movie}')
@@ -343,14 +380,20 @@ def eval(args):
                             start = end - batch
                         starts.append(start)
                         feat = features[start:end][None]
+                        # ClipCraft: audio windows follow the identical slice / permutation / zoom.
+                        aud = audio_windows[start:end][None] if audio_windows is not None else None
                         if args.q_feat_dir is not None:# and i==0:
                             query_feats_temp = pad_sequences_1d(query_feats[None,].repeat(feat.shape[0],1,1), dtype=query_feats.dtype, device=query_feats.device, fixed_length=None)
                         idx = torch.randperm(feat.size(1))
                         feat = feat[:, idx]
+                        if aud is not None:
+                            aud = aud[:, idx]
                         indexes.append(idx)
                         if hierarchy_zoom>1:
                             feat = feat.repeat_interleave(hierarchy_zoom,1)
-                        answer, model_output = inference(model, feat, query_feats_temp, "<video>\n" + query.format(sentence), tokenizer, return_list=True)
+                            if aud is not None:
+                                aud = aud.repeat_interleave(hierarchy_zoom,1)
+                        answer, model_output = inference(model, feat, query_feats_temp, "<video>\n" + query.format(sentence), tokenizer, return_list=True, audio_feats=aud)
                         answers.extend(answer)
                         hierarchy_zooms.append(hierarchy_zoom)
                         entropy = get_entropy_statistics(torch.cat([a[:, None] for a in model_output['scores']], 1), 0,

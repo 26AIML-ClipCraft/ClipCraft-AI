@@ -1,18 +1,31 @@
-decord
-easydict
-einops
-gradio
-numpy
-pandas>=2.0.3
-peft>=0.4.0
-Pillow
-tqdm
+# ClipCraft audio-visual ReVisionLLM — single RTX 4090 (Ada, sm_89) environment.
+# CUDA 12.1 wheels:  pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# deepspeed / flash-attn are intentionally NOT required: training runs on one GPU with
+# HF Trainer and SDPA attention (train.py --attn_implementation sdpa). Install
+# deepspeed only if you re-run the original multi-GPU scripts/{mad,chapters}/*.sh.
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
 transformers==4.41.2
-git+https://github.com/openai/CLIP.git
+peft>=0.11.1,<0.13
+accelerate>=0.30.1
+bitsandbytes>=0.43.1        # optional 4-bit QLoRA path (--bits 4)
 sentencepiece==0.2.0
 protobuf
-wandb
-deepspeed==0.14.0
+numpy<2
+pandas>=2.0.3
+einops
+easydict
+Pillow
+tqdm
 lmdb
 msgpack
 tensorboard
+wandb
+decord
+ffmpeg-python               # CLIP frame decoding (revisionllm/data/feature_extraction/clip_extractor.py)
+yt-dlp                      # VidChapters download (revisionllm/data/audio_pipeline/download_and_extract.py)
+soundfile                   # CLAP feature-extractor dependency in transformers
+anthropic>=1.0              # query-type labelling (label_query_types.py), optional
+gradio
+git+https://github.com/openai/CLIP.git

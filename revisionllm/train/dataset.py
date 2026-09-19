@@ -53,6 +53,20 @@ class DataArguments:
     sparse_dataset: bool = False
     sparse_length: int = 0
     long_baseline: bool = False
+    # ---- ClipCraft audio branch ------------------------------------------------
+    # LMDB of CLAP features, key = video id, value = npz{'features': (T_audio, audio_dim)}
+    # extracted with a fixed hop of ``audio_hop_sec`` seconds (default 1 s).
+    audio_feat_folder: Optional[str] = field(default=None)
+    audio_dim: int = 512
+    audio_hop_sec: float = 1.0
+    # Sample-level modality dropout (applied in the collator, training only):
+    # with prob. ``modality_dropout_visual`` the visual features of a sample are
+    # zeroed, with prob. ``modality_dropout_audio`` the audio features are zeroed.
+    modality_dropout_visual: float = 0.0
+    modality_dropout_audio: float = 0.0
+    # Bounded LRU cache of whole-video CLIP features (entries). The original code
+    # cached every video forever, which does not fit VidChapters in RAM.
+    visual_cache_size: int = 64
 
 def _tokenize_fn(strings: Sequence[str],
                  tokenizer: transformers.PreTrainedTokenizer) -> Dict:
@@ -401,10 +415,32 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    modality_dropout_visual: float = 0.0
+    modality_dropout_audio: float = 0.0
+
+    def _apply_modality_dropout(self, instances: Sequence[Dict]) -> Sequence[Dict]:
+        """
+        ClipCraft: sample-level modality dropout. Exactly one draw per instance:
+          r < p_v            -> zero the visual features (audio-only sample)
+          p_v <= r < p_v+p_a -> zero the audio features  (visual-only sample)
+        Done here (not in __getitem__) so `random.choice(self)` retries inside the
+        dataset can never apply it twice to the same sample.
+        """
+        p_v, p_a = self.modality_dropout_visual, self.modality_dropout_audio
+        if p_v <= 0 and p_a <= 0:
+            return instances
+        for ins in instances:
+            r = random.random()
+            if r < p_v and ins.get('image') is not None:
+                ins['image'] = torch.zeros_like(ins['image'])
+            elif r < p_v + p_a and ins.get('audio') is not None:
+                ins['audio'] = torch.zeros_like(ins['audio'])
+        return instances
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         if not hasattr(self, 'iteration_step'):
             self.iteration_step = 0
+        instances = self._apply_modality_dropout(instances)
         batch = self.get_batch(instances)
         if 'clip2' in instances[0]:
             batch['clip2']=self.get_batch([ins['clip2'] for ins in instances])
@@ -438,6 +474,14 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+        # ClipCraft: audio follows exactly the same batching rule as images so the
+        # two always share leading dims ((b,t,·) or (b,v,t,·) or a ragged list).
+        if 'audio' in instances[0] and instances[0]['audio'] is not None:
+            audios = [instance['audio'] for instance in instances]
+            if all(x is not None and x.shape == audios[0].shape for x in audios):
+                batch['audio_feats'] = torch.stack(audios)
+            else:
+                batch['audio_feats'] = audios
         if 'start_end_frame' in batch:
             batch['start_end_frame'] = torch.stack([torch.tensor(instance['start_end_frame']) for instance in instances])
 
@@ -502,7 +546,9 @@ class LazySupervisedDataset(Dataset):
         self.data_args = data_args
         self.appearance_visual_env = None
         self.textual_env = None
-        self.videofeat = {}
+        self.audio_env = None
+        self.videofeat = collections.OrderedDict()  # bounded LRU, see _get_cached_video_feat
+        self._missing_audio = set()
 
 
     def _init_db(self):
@@ -512,6 +558,62 @@ class LazySupervisedDataset(Dataset):
         if self.data_args.q_feat_dir is not None:
             self.textual_env = lmdb.open(self.data_args.q_feat_dir, readonly=True, create=False, max_readers=4096 * 8, readahead=False)
             self.textual_txn = self.textual_env.begin(buffers=True)
+        if getattr(self.data_args, 'audio_feat_folder', None) is not None and self.audio_env is None:
+            self.audio_env = lmdb.open(self.data_args.audio_feat_folder, readonly=True, create=False, max_readers=4096 * 8, readahead=False, lock=False)
+            self.audio_txn = self.audio_env.begin(buffers=True)
+
+    # ---- ClipCraft audio helpers -------------------------------------------------
+    def _get_cached_video_feat(self, vid):
+        """Whole-video CLIP features with a bounded LRU (was an unbounded dict)."""
+        if vid in self.videofeat:
+            self.videofeat.move_to_end(vid)
+            return self.videofeat[vid]
+        feat = self._get_video_appearance_feat_by_vid(vid)
+        self.videofeat[vid] = feat
+        while len(self.videofeat) > max(1, int(self.data_args.visual_cache_size)):
+            self.videofeat.popitem(last=False)
+        return feat
+
+    def _get_audio_feat_by_vid(self, vid):
+        """(T_audio, audio_dim) float32 CLAP features at ``audio_hop_sec`` hop, or None."""
+        if self.audio_env is None:
+            self._init_db()
+        if self.audio_env is None or vid in self._missing_audio:
+            return None
+        dump = self.audio_txn.get(vid.encode())
+        if dump is None:
+            self._missing_audio.add(vid)
+            return None
+        with io.BytesIO(dump) as reader:
+            a_dump = np.load(reader, allow_pickle=True)
+            a_feat = a_dump['features']
+        return np.asarray(a_feat, dtype=np.float32)
+
+    def align_audio_to_frames(self, audio, frame_indices, feature_fps=None):
+        """
+        Nearest-hop alignment: frame index -> seconds (index / real feature fps)
+        -> audio row floor(sec / hop). ``feature_fps`` must be the *real* fps of
+        the stored CLIP features (2 for VidChapters), not the doubled value the
+        original loader uses internally for short videos.
+        Returns (len(frame_indices), audio_dim) float32; zeros when audio is None.
+        """
+        fps = float(feature_fps if feature_fps is not None else self.data_args.feature_fps)
+        frame_indices = np.asarray(frame_indices, dtype=np.int64)
+        if audio is None or len(audio) == 0:
+            return np.zeros((len(frame_indices), self.data_args.audio_dim), dtype=np.float32)
+        secs = frame_indices.astype(np.float64) / fps
+        rows = np.floor(secs / float(self.data_args.audio_hop_sec)).astype(np.int64)
+        rows = np.clip(rows, 0, len(audio) - 1)
+        return audio[rows]
+
+    def _load_aligned_audio(self, vid, frame_indices):
+        try:
+            audio = self._get_audio_feat_by_vid(vid)
+        except Exception as e:
+            if self.data_args.debug_my_dataset:
+                raise
+            audio = None
+        return torch.from_numpy(self.align_audio_to_frames(audio, frame_indices))
 
     def _get_video_appearance_feat_by_vid(self, vid):
         if self.data_args.vis_feat_storage == 'lmdb':
@@ -568,6 +670,7 @@ class LazySupervisedDataset(Dataset):
             try:
                 source = copy.deepcopy(self.list_data_dict[i])
                 neg_images = []
+                neg_audios = []
                 num_pos = random.randint(2,3)
                 if self.data_args.hierarchy_zoom:
                     if self.data_args.fix_hierarchy_zoom > 0:
@@ -589,16 +692,19 @@ class LazySupervisedDataset(Dataset):
                     if source['meta']['token']['<e0>'] < neg_data['hier_neg_start']/self.data_args.feature_fps or  \
                         source['meta']['token']['<s0>'] > neg_data['hier_neg_start']/self.data_args.feature_fps + self.data_args.debug_window:
                         neg_images.append(neg_data['image'])
+                        neg_audios.append(neg_data.get('audio'))
                         starts.append(neg_data['hier_neg_start'])
 
                 starts = numpy.array(starts)
                 inds = starts.argsort()
                 starts = [starts[i] for i in inds]
                 neg_images = [neg_images[i] for i in inds]
+                neg_audios = [neg_audios[i] for i in inds]
 
                 if source['conversations'][1]['value'] == self.neg_value and self.data_args.hierarchy_neg:
                     pos_data = neg_data
                     image = np.stack(neg_images, axis=0)
+                    audio_list = neg_audios
                 else:
                     pos_idx = random.randint(0, self.data_args.hierarchy_num_videos//hierarchy_zoom - num_pos)
                     pos_data = []
@@ -611,11 +717,21 @@ class LazySupervisedDataset(Dataset):
                             else:
                                 pos_data.append(self.getitem(i, conv_value = f"From {pos_idx} to {pos_idx+num_pos}."))
                     image = [pd['image'] for pd in pos_data]
+                    audio_list = [pd.get('audio') for pd in pos_data]
                     image = neg_images[:pos_idx] + image + neg_images[pos_idx:]
+                    audio_list = neg_audios[:pos_idx] + audio_list + neg_audios[pos_idx:]
                     image = [item for item in image for i in range(hierarchy_zoom)]
+                    audio_list = [item for item in audio_list for i in range(hierarchy_zoom)]
                     image = np.stack(image, axis=0)
-                pos_data[0]['image'] = torch.from_numpy(image)
-                return pos_data[0]
+                if isinstance(pos_data, list):
+                    pos_data = pos_data[0]
+                pos_data['image'] = torch.from_numpy(image)
+                # ClipCraft: stack audio in exactly the same sub-video order -> (V, T, audio_dim)
+                if self.data_args.audio_feat_folder is not None and all(a is not None for a in audio_list):
+                    pos_data['audio'] = torch.stack([torch.as_tensor(a) for a in audio_list], dim=0)
+                else:
+                    pos_data.pop('audio', None)
+                return pos_data
             except:
                 if self.data_args.debug_my_dataset:
                     raise
@@ -653,6 +769,9 @@ class LazySupervisedDataset(Dataset):
         # image = torch.zeros((self.data_args.num_frames if data_type == 'video' else 1, 768), dtype=torch.float16)
         # image = np.zeros((self.data_args.num_frames*factor if data_type == 'video' else 1, 768))
 
+        # ClipCraft: indices (into the stored feature array) of the frames that end
+        # up in ``image``; used to fetch time-aligned audio rows.
+        frame_indices = None
         try:
             if self.t2v is not None:
                 if self.data_args.hierarchy:
@@ -698,9 +817,7 @@ class LazySupervisedDataset(Dataset):
                     if 'query_id' in source and self.data_args.q_feat_dir is not None:
                         query_feat, query_cls_feat = self._get_query_feat_by_qid(source["query_id"])
                     if self.data_args.vis_feat_storage == 'lmdb':
-                        if source['id'] not in self.videofeat:
-                            self.videofeat[source['id']] = self._get_video_appearance_feat_by_vid(source['id'])
-                        image = self.videofeat[source['id']]
+                        image = self._get_cached_video_feat(source['id'])
                     else:
                         image = self._get_video_appearance_feat_by_vid(source['id'])
                 else:
@@ -795,6 +912,9 @@ class LazySupervisedDataset(Dataset):
                     if image.shape[0] > self.data_args.num_frames:
                         sampled_indices = np.linspace(start, end, self.data_args.num_frames, dtype=np.int32)
                         image = image[sampled_indices]
+                        frame_indices = sampled_indices
+                    else:
+                        frame_indices = np.arange(image.shape[0])
 
             if not torch.is_tensor(image):#'ego4d_stage1' not in self.data_args.feat_folder:
                 image = torch.from_numpy(image)
@@ -855,6 +975,12 @@ class LazySupervisedDataset(Dataset):
             return random.choice(self)
         data_dict['image'] = image
         # print('dataset.image.shape', image.shape)
+        # ClipCraft: time-aligned CLAP features, same length as ``image`` (T, audio_dim).
+        # Missing audio => zeros, so the fused model degrades to visual-only for that sample.
+        if self.data_args.audio_feat_folder is not None:
+            if frame_indices is None:
+                frame_indices = np.arange(image.shape[0])
+            data_dict['audio'] = self._load_aligned_audio(source['id'], frame_indices)
         if self.data_args.q_feat_dir is not None:
             data_dict['query_feat'] = query_feat
         if 'meta' in source:
@@ -872,7 +998,10 @@ class LazySupervisedDataset(Dataset):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args: DataArguments) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer,
+        modality_dropout_visual=getattr(data_args, 'modality_dropout_visual', 0.0),
+        modality_dropout_audio=getattr(data_args, 'modality_dropout_audio', 0.0))
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args,

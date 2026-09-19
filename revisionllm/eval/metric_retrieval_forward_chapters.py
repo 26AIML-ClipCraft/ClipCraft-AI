@@ -89,6 +89,8 @@ if __name__ == "__main__":
     parser.add_argument("--distributed_grounding", type=int, default=16)
     parser.add_argument("--distributed_retrieval", type=int, default=16)
     parser.add_argument("--single", type=bool, default=True)
+    parser.add_argument("--dump_path", type=str, default=None,
+                        help="ClipCraft: write the merged per-query logs (after window selection, buffer=0) as jsonl for ablation_report.py")
 
     args = parser.parse_args()
 
@@ -182,3 +184,8 @@ if __name__ == "__main__":
             print_metrics(metrics)
             with open(args.grounding_path + '/result_retrieval.txt', 'w+') as f:
                 json.dump(metrics, f)
+            if args.dump_path is not None and buffer == 0:
+                with open(args.dump_path, 'w') as f:
+                    for gl in grunding_dict:
+                        f.write(json.dumps(gl) + '\n')
+                print('wrote merged per-query logs to', args.dump_path)

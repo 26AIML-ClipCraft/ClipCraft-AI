@@ -25,7 +25,8 @@ import numpy as np
 import clip
 
 
-def inference(model, image, query_feats, query, tokenizer, visual_memory = None, prefix_memory=None, return_list=False):
+def inference(model, image, query_feats, query, tokenizer, visual_memory = None, prefix_memory=None, return_list=False,
+              audio_feats=None, iteration_step=None):
     if visual_memory is not None:
         query = query + '<memory>'
     conv = conv_templates["v1"].copy()
@@ -45,6 +46,8 @@ def inference(model, image, query_feats, query, tokenizer, visual_memory = None,
         model_output = model.generate(
             input_ids,
             images=image.cuda() if torch.cuda.is_available() else image,
+            audio_feats=(audio_feats.cuda() if (audio_feats is not None and torch.cuda.is_available()) else audio_feats),
+            iteration_step=(torch.tensor(int(iteration_step)) if iteration_step is not None else None),
             query_feats = query_feats,
             do_sample=True,
             temperature=0.05,

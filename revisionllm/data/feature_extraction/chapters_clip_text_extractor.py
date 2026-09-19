@@ -2,6 +2,7 @@
 Utility: extract clip-based textual eot feature and textual token feature into a single lmdb file for MAD dataset
 """
 import json
+import os
 
 import torch
 import numpy as np
@@ -64,10 +65,10 @@ def pad_collate(data):
 
 
 def extract_mad_text_feature(args):
-    split_list = ['train', 'test', 'val',]
+    split_list = args.splits.split(',')
     total_data = []
     for split in split_list:
-        filename = f"/data/chapters/chapters_vmr_{split}.jsonl"
+        filename = os.path.join(args.chapters_dir, f"chapters_vmr_{split}.jsonl")
         if 'jsonl' in filename:
             with open(filename) as f:
                 data = [json.loads(line) for line in f]
@@ -77,7 +78,7 @@ def extract_mad_text_feature(args):
     print(len(total_data))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Build models...")
-    clip_model_name_or_path = "ViT-L/14"
+    clip_model_name_or_path = args.clip_path
     feature_extractor = ClipFeatureExtractor(
         framerate=30, size=224, centercrop=True,
         model_name_or_path=clip_model_name_or_path, device=device
@@ -87,13 +88,14 @@ def extract_mad_text_feature(args):
 
     eval_dataloader = DataLoader(dataset, batch_size=60, collate_fn=pad_collate)
 
-    feature_save_path = f'/data/chapters/chapters_clip_L14_text_features_train'
+    feature_save_path = args.feature_output_path
+    os.makedirs(feature_save_path, exist_ok=True)
     text_output_env = lmdb.open(feature_save_path, map_size=1099511627776, lock=False)
 
     for i, batch in enumerate(tqdm.tqdm(eval_dataloader, desc="Evaluating", total=len(eval_dataloader))):
         query_id_list = [str(qid) for qid in batch["qid"]]
         query_list = batch["query"]
-        if 'train' in feature_save_path or isinstance(query_list[0], list):
+        if args.key_style == 'vid_idx' or isinstance(query_list[0], list):
             new_query_id_list = []
             new_query_list = []
             for i in range(len(query_list)):
@@ -129,8 +131,13 @@ def extract_mad_text_feature(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--feature_output_path", help="Path to train split"
-    )  # "/s1_md0/leiji/v-zhijian/MAD_data/CLIP_text_features"
+    parser.add_argument("--feature_output_path", required=True, help="output LMDB dir")
+    # ClipCraft: paths were hard-coded to /data/chapters; make them arguments.
+    parser.add_argument("--chapters_dir", default="/data/chapters", help="dir with chapters_vmr_<split>.jsonl")
+    parser.add_argument("--splits", default="train", help="comma list, e.g. 'train' or 'test' or 'val'")
+    parser.add_argument("--clip_path", default="ViT-L/14", help="CLIP name or ViT-L-14.pt path")
+    parser.add_argument("--key_style", choices=["vid_idx", "qid"], default="vid_idx",
+                        help="LMDB key: '<vid>_<j>' for train annotations (chapters_to_activitynet.py) or the "
+                             "record's qid for test/val annotations (chapters_test_to_activitynet.py)")
     args = parser.parse_args()
     extract_mad_text_feature(args)

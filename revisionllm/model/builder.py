@@ -19,7 +19,9 @@ def load_lora(model, lora_path, is_trainable=False):
     return model
 
 def load_pretrained_model(args, stage2=None, stage3=None, load_ckp=False):
-    kwargs = {'torch_dtype': torch.float16}
+    # ClipCraft: SDPA attention (torch>=2.x) replaces the flash-attn monkey patch.
+    kwargs = {'torch_dtype': torch.float16,
+              'attn_implementation': getattr(args, 'attn_implementation', 'sdpa')}
 
     # model_path = os.path.expanduser(args.model_path)
     model_base = args.model_base

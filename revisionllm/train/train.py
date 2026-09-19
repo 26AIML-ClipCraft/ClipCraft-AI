@@ -15,8 +15,10 @@
 #    limitations under the License.
 
 import os
+import time
+import json
 
-from transformers import AutoModel, AutoTokenizer, PretrainedConfig
+from transformers import AutoModel, AutoTokenizer, PretrainedConfig, TrainerCallback
 
 from revisionllm.model.vtimellm_llama import VTimeLLMConfig
 
@@ -66,11 +68,25 @@ class ModelArguments:
     clip_adapter_feature: Optional[str] = field(default='temporal') #'cls', "all", "alternate"
     hierarchy: bool = field(default=False)
     dual_adapter: bool = field(default=False)
+    # ---- ClipCraft audio branch ------------------------------------------------
+    audio_fusion: bool = field(default=False, metadata={"help": "Add the CLAP additive-fusion branch."})
+    audio_dim: int = field(default=512)
+    audio_gate_init: float = field(default=0.0, metadata={"help": "Initial value of the fusion gate alpha (0 => identity at step 0)."})
+    audio_dropout: float = field(default=0.0)
+    pretrain_audio_fusion: Optional[str] = field(default=None, metadata={"help": "non_lora_trainables.bin holding audio_fusion.* weights."})
+    tune_audio_fusion: bool = field(default=False, metadata={"help": "Make audio_fusion.* trainable (Stage A/B)."})
+    freeze_audio_fusion: bool = field(default=False, metadata={"help": "Force audio_fusion.* frozen (Stage C)."})
+    tune_clip_adapter: bool = field(default=False, metadata={"help": "Make the ClipEncoder adapter (mm_projector / cross_attn) trainable WITHOUT freezing everything else (Stage B)."})
+    freeze_lora: bool = field(default=False, metadata={"help": "Freeze all lora_* params (Stage A: audio branch only)."})
+    attn_implementation: str = field(default="sdpa", metadata={"help": "'sdpa' (torch>=2) replaces the flash-attn monkey patch; 'eager' as fallback."})
 
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     training_stage: int = field(default=2)
+    # ---- ClipCraft single-GPU / 1-day-job support ---------------------------------
+    audio_lr_multiplier: float = field(default=1.0, metadata={"help": "LR multiplier for audio_fusion.* params (e.g. 10)."})
+    max_train_hours: float = field(default=0.0, metadata={"help": "Wall-clock budget; >0 => save a checkpoint and stop cleanly, resume by re-running the same script."})
     n_gpu: int = field(default=1)
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
@@ -107,9 +123,10 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+    # ClipCraft: deepspeed is optional (single-GPU runs do not install it).
     if hasattr(param, "ds_id"):
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
         if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if not ignore_status:
                 logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
@@ -118,6 +135,49 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     else:
         param = param.detach().cpu().clone()
     return param
+
+
+# ---- ClipCraft helpers -----------------------------------------------------------
+ALWAYS_SAVE_KEYS = ('audio_fusion.', 'cross_attn.', 'mm_projector', 'alternate_layer_norm')
+
+
+def get_non_lora_state_dict_for_save(model):
+    """
+    Trainable non-LoRA params (original behaviour) PLUS the adapter / audio
+    modules even when frozen, so every stage output directory is self-contained
+    and can be loaded by ``load_lora`` (stage2_path) or the eval builder without
+    re-pointing --pretrain_clip_adapter / --pretrain_audio_fusion at older runs.
+    """
+    sd = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+    for k, t in model.named_parameters():
+        if 'lora_' in k or k in sd:
+            continue
+        if any(s in k for s in ALWAYS_SAVE_KEYS):
+            sd[k] = maybe_zero_3(t, ignore_status=True).cpu()
+    return sd
+
+
+class TimeLimitCallback(TrainerCallback):
+    """Save a checkpoint and stop cleanly once ``max_train_hours`` elapsed (1-day job limit)."""
+
+    def __init__(self, max_hours: float):
+        self.deadline = time.time() + max_hours * 3600.0 if max_hours and max_hours > 0 else None
+        self.triggered = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.deadline is not None and time.time() >= self.deadline and state.global_step < state.max_steps:
+            print(f"[TimeLimitCallback] {args.max_train_hours}h elapsed at step {state.global_step}/{state.max_steps}: "
+                  f"saving checkpoint and stopping. Re-run the same script to resume.")
+            control.should_save = True
+            control.should_training_stop = True
+            self.triggered = True
+        return control
+
+
+def run_is_complete(output_dir: str) -> bool:
+    """Final artefacts exist => nothing to do (a re-submitted job after completion)."""
+    return (os.path.exists(os.path.join(output_dir, 'non_lora_trainables.bin'))
+            and os.path.exists(os.path.join(output_dir, 'adapter_config.json')))
 
 
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
@@ -258,6 +318,7 @@ def train():
             cache_dir=training_args.cache_dir,
             **bnb_model_from_pretrained_args,
             low_cpu_mem_usage=model_args.debug_server,
+            attn_implementation=model_args.attn_implementation,
             #use_safetensors=True,
         )
     else:
@@ -369,6 +430,34 @@ def train():
     if model_args.cross_attn:
         model.get_model().cross_attn.to(dtype=compute_dtype, device=training_args.device)
 
+    # ---- ClipCraft: explicit per-module trainability -------------------------------
+    # PeftModel.from_pretrained() freezes every non-LoRA param, including the
+    # adapter and the audio branch created before it, so each stage says exactly
+    # what it trains:
+    #   Stage A : --tune_audio_fusion --freeze_lora
+    #   Stage B : --tune_audio_fusion --tune_clip_adapter          (LoRA trainable via training_stage 4)
+    #   Stage C : --freeze_mm_mlp_adapter --freeze_audio_fusion    (LoRA only)
+    if model_args.tune_clip_adapter:
+        for p in model.get_model().mm_projector.parameters():
+            p.requires_grad = True
+        if model_args.cross_attn:
+            for p in model.get_model().cross_attn.parameters():
+                p.requires_grad = True
+        if hasattr(model.get_model(), 'alternate_layer_norm'):
+            for p in model.get_model().alternate_layer_norm.parameters():
+                p.requires_grad = True
+    if model_args.audio_fusion:
+        audio_fusion = model.get_model().audio_fusion
+        audio_fusion.to(dtype=compute_dtype, device=training_args.device)
+        train_audio = bool(model_args.tune_audio_fusion) and not model_args.freeze_audio_fusion
+        for p in audio_fusion.parameters():
+            p.requires_grad = train_audio
+        rank0_print(f"audio_fusion trainable={train_audio}, gate={float(audio_fusion.audio_gate):.4f}")
+    if model_args.freeze_lora:
+        for n, p in model.named_parameters():
+            if 'lora_' in n:
+                p.requires_grad = False
+
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -383,19 +472,32 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    if run_is_complete(training_args.output_dir):
+        rank0_print(f"[train] {training_args.output_dir} already holds final weights; nothing to do.")
+        return
+
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     print_trainable_parameters(model)
+    time_limit = TimeLimitCallback(training_args.max_train_hours)
     trainer = VTimeLLMTrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
+                    callbacks=[time_limit],
                     **data_module)
 
+    # Auto-resume from the newest checkpoint-* (optimizer, scheduler and RNG state
+    # included), so a job re-submitted after the 1-day limit continues seamlessly.
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
+
+    if time_limit.triggered or trainer.state.global_step < trainer.state.max_steps:
+        rank0_print(f"[train] stopped at step {trainer.state.global_step}/{trainer.state.max_steps} "
+                    f"(time limit). Final weights NOT written; re-run to resume.")
+        return
 
     model.config.use_cache = True
 
@@ -403,9 +505,7 @@ def train():
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
         )
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
-            model.named_parameters()
-        )
+        non_lora_state_dict = get_non_lora_state_dict_for_save(model)
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
