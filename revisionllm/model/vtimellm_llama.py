@@ -100,13 +100,28 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         iteration_step = kwargs.pop("iteration_step", None)
         kwargs.pop("cache_position", None)
 
+        # ClipCraft (transformers 4.41): the single <video> placeholder in input_ids is expanded into many positions of
+        # the KV cache, so HF's "cache length == number of tokens" slicing no longer holds and the whole prompt would be
+        # re-fed at step 2. Once there is a cache, feed only the newest token with a mask sized to the cache.
+        past_len = 0
+        if past_key_values is not None:
+            past_len = (past_key_values.get_seq_length() if hasattr(past_key_values, "get_seq_length")
+                        else past_key_values[0][0].shape[-2])
+        if past_len > 0:
+            input_ids = input_ids[:, -1:]
+            kwargs["attention_mask"] = torch.ones(input_ids.shape[0], past_len + 1, dtype=torch.long, device=input_ids.device)
+            kwargs.pop("position_ids", None)
+
         _inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
+        _inputs.pop('cache_position', None)   # transformers 4.41 adds it; forward() has no such argument
         if images is not None:
             _inputs['images'] = images
         if audio_feats is not None:
             _inputs['audio_feats'] = audio_feats
+        if iteration_step is not None:
+            _inputs['iteration_step'] = iteration_step   # was popped above and never handed to forward()
         if query_feats is not None:
             _inputs['query_feats'] = query_feats
         if visual_memory is not None:

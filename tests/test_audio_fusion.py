@@ -45,6 +45,32 @@ def test_hierarchy_shape_and_gradient():
     assert m.audio_fc_out.weight.grad.abs().sum() > 0
 
 
+def _grads_after_steps(gate_init, steps=5):
+    torch.manual_seed(0)
+    m = AudioFusion(audio_dim=512, visual_dim=768, gate_init=gate_init)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=0.0)
+    v, a = torch.randn(2, 20, 768), torch.randn(2, 20, 512)
+    for _ in range(steps):
+        opt.zero_grad()
+        m(v, a).pow(2).mean().backward()
+        opt.step()
+    opt.zero_grad()
+    m(v, a).pow(2).mean().backward()
+    return m
+
+
+def test_stage_a_gate_init_escapes_zero_gradient():
+    # gate=0 and fc_out=0 at once => every audio parameter has exactly zero gradient, forever.
+    dead = _grads_after_steps(0.0)
+    assert float(dead.audio_gate) == 0.0 and dead.audio_fc_out.weight.abs().sum() == 0
+    # Stage A / B default (gate_init 0.1): still identity at step 0, but gate and fc_out must start moving.
+    v, a = torch.randn(2, 20, 768), torch.randn(2, 20, 512)
+    assert torch.equal(AudioFusion(512, 768, gate_init=0.1)(v, a), v)
+    live = _grads_after_steps(0.1)
+    assert live.audio_fc_out.weight.abs().sum() > 0
+    assert live.audio_gate.grad.abs() > 0 and live.audio_fc_in.weight.grad.abs().sum() > 0
+
+
 def test_alignment_matches_between_train_and_eval():
     from revisionllm.train.dataset import LazySupervisedDataset
     fps, hop = 2.0, 1.0

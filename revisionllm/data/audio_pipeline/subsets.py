@@ -5,8 +5,10 @@ Why official splits: the released ReVisionLLM checkpoint saw the whole official
 train set, so carving a "val" out of train would inflate the R0 / visual-only
 baselines. See the experiment design doc (데이터 section).
 
-Inputs  : chapters_vmr_{train,val,test}.jsonl  (VidChapters VMR format, one
-          record per video with 'vid', 'duration', 'query'[], 'relevant_windows'[])
+Inputs  : chapters_vmr_{train,val,test}.jsonl  (VidChapters VMR format)
+          train    : one record per VIDEO  ('vid' = 11-char YouTube id, 'query'[] / 'relevant_windows'[] lists)
+          val/test : one record per QUERY  ('vid' = "<chapter index><YouTube id>", e.g. "3uwN1yCPgJgk")
+          -> everything here works on the 11-char YouTube id, see youtube_id()
 Outputs : <out_dir>/{train_sub,val_sub,test_sub}_candidates.json
           -> lists of video ids (candidate = before audio availability check).
           finalize_subsets.py turns candidates into the frozen final lists.
@@ -28,6 +30,26 @@ STRATA = [  # (name, min_sec, max_sec, share)
     ("20to60m", 20 * 60, 60 * 60, 0.30),
     ("gt60m", 60 * 60, float("inf"), 0.10),
 ]
+
+
+def youtube_id(vid):
+    """YouTube ids are always 11 chars. val/test records prefix the chapter index (digits); train has none."""
+    return vid[-11:]
+
+
+def check_vid_format(records, name):
+    bad = [r["vid"] for r in records if len(r["vid"]) < 11 or (r["vid"][:-11] and not r["vid"][:-11].isdigit())]
+    assert not bad, f"{name}: unexpected vid format (expected [digits]+11-char id), e.g. {bad[:3]}"
+
+
+def group_by_video(records):
+    """val/test: one row per query -> one entry per video {id, duration, n_queries}."""
+    vids = {}
+    for r in records:
+        y = youtube_id(r["vid"])
+        e = vids.setdefault(y, {"vid": y, "duration": r["duration"], "n_queries": 0})
+        e["n_queries"] += 1
+    return [vids[k] for k in sorted(vids)]
 
 
 def read_jsonl(path):
@@ -92,6 +114,13 @@ def main():
     test = read_jsonl(a.test_jsonl)
     print(f"official sizes: train={len(train)} val={len(val)} test={len(test)}")
 
+    for name, recs in (("train", train), ("val", val), ("test", test)):
+        check_vid_format(recs, name)
+    for r in train:
+        r["vid"] = youtube_id(r["vid"])
+    val, test = group_by_video(val), group_by_video(test)
+    print(f"unique videos: train={len(train)} val={len(val)} test={len(test)}")
+
     train_pick, train_reserve = sample_train(train, a.train_hours, a.reserve_factor, rng)
     val_pick = sample_uniform(val, a.val_videos + a.test_reserve, rng)
     test_pick = sample_uniform(test, a.test_videos + a.test_reserve, rng)
@@ -101,8 +130,10 @@ def main():
     val_ids = [r["vid"] for r in val_pick]
     assert not (set(train_ids) & set(test_ids)), "train/test overlap in official splits?!"
     assert not (set(train_ids) & set(val_ids)), "train/val overlap in official splits?!"
+    assert not (set(val_ids) & set(test_ids)), "val/test overlap in official splits?!"
 
-    meta = {r["vid"]: {"duration": r["duration"], "n_queries": len(r.get("query", []))} for r in train + val + test}
+    meta = {r["vid"]: {"duration": r["duration"], "n_queries": r.get("n_queries", len(r.get("query", [])))}
+            for r in train + val + test}
     out = {
         "train_sub_candidates.json": {"seed": a.seed, "target_hours": a.train_hours, "ids": train_ids,
                                       "reserve_by_stratum": train_reserve},

@@ -75,7 +75,8 @@ def parse_args():
     parser.add_argument("--hierarchy", type=bool, default=False)
     parser.add_argument("--score_merge", type=str, default='multiply', choices=['add', 'multiply'])
     parser.add_argument("--normalize", type=bool, default=True)
-    parser.add_argument("--skip_small_videos", type=bool, default=True)
+    parser.add_argument("--skip_small_videos", type=lambda v: str(v).lower() in ("1", "true", "yes"), default=True,
+                        help="skip videos <= debug_window (default, as released). False: evaluate them as ONE window covering the whole video")
     parser.add_argument("--baseline", type=bool, default=False)
     parser.add_argument("--plus_baseline", type=bool, default=False)
     # ---- ClipCraft audio branch ----
@@ -239,10 +240,13 @@ def eval(args):
 
             gt_len = math.ceil(data['timestamps'][1] - data['timestamps'][0])
 
+            short_video = False
             if 'movie_duration' in data and data['movie_duration'] <= args.debug_window:
                 if args.skip_small_videos:
                     continue
                 else:
+                    # ClipCraft: the whole video fits in one window; stretch it onto num_frames frames
+                    short_video = True
                     sampled_indices = np.linspace(0, features.shape[0]-1, args.num_frames, dtype=np.int32)
                     features = features[sampled_indices]
                     frame_rows = frame_rows[sampled_indices]
@@ -257,6 +261,8 @@ def eval(args):
             clip_length = args.debug_window * args.feature_fps
             num_window = math.ceil(ctx_l / (clip_length//2)) - 1
             windowidx = [1] if args.baseline else list(range(num_window))
+            if short_video:
+                windowidx = [0]   # one window = the whole (resampled) video
             clip_feats = []
             clip_audios = []
             for i in windowidx:
@@ -342,7 +348,7 @@ def eval(args):
                 #     scores_ = [-s / max_entropy + eps for s in scores]
                 duration = data['movie_duration'] if 'movie_duration' in data else data['duration']
                 gt = (timestamps[0] / duration, timestamps[1] / duration)
-                num_frames_video = int(duration * args.num_frames / args.debug_window)
+                num_frames_video = args.num_frames if short_video else int(duration * args.num_frames / args.debug_window)
                 frames, ious, scores_entropy = iou(answers, gt, args.num_frames, num_frames_video, scores_entropy, args.plus_baseline)
                 # if args.score == 'cosine_sim':
                 for k,v in frames.items():
@@ -377,6 +383,8 @@ def eval(args):
         except:
             # if args.debug:
             #     raise
+            if len(errors) < 3:  # ClipCraft: show why queries fail instead of silently dropping them
+                import traceback; traceback.print_exc()
             errors.append(id)
     print('errors', errors)
 

@@ -534,10 +534,14 @@ class LazySupervisedDataset(Dataset):
             #         data['conversations'][1]['value'] = 'yes'
             if data_args.neg_samples > 1:
                 for data in self.list_data_dict[::int(data_args.neg_samples)]:
+                    if data.get('source') == 'charades':   # ClipCraft: a 30 s video is one window, no negative window exists
+                        continue
                     data['conversations'][1]['value'] = self.neg_value
             else:
                 neg_list = []
                 for data in self.list_data_dict[::int(1/data_args.neg_samples)]:
+                    if data.get('source') == 'charades':
+                        continue
                     neg_data = copy.deepcopy(data)
                     neg_data['conversations'][1]['value'] = self.neg_value
                     neg_list.append(neg_data)
@@ -772,6 +776,7 @@ class LazySupervisedDataset(Dataset):
         # ClipCraft: indices (into the stored feature array) of the frames that end
         # up in ``image``; used to fetch time-aligned audio rows.
         frame_indices = None
+        whole_video = False
         try:
             if self.t2v is not None:
                 if self.data_args.hierarchy:
@@ -837,11 +842,19 @@ class LazySupervisedDataset(Dataset):
                         feature_path = '{}/{}.npy'.format(self.data_args.feat_folder, source['id'])
                         image = np.load(feature_path) # <N, 768> float16
 
+                whole_video = source.get('source') == 'charades'
+                if whole_video:
+                    # ClipCraft: short videos (Charades, ~30 s) are ONE window covering the whole video, stretched onto
+                    # num_frames frames exactly like the dense evaluation does (eval_nlq_negative: short_video).
+                    sampled_indices = np.linspace(0, image.shape[0] - 1, self.data_args.num_frames, dtype=np.int32)
+                    frame_indices = sampled_indices
+                    image = image[sampled_indices]
+                    start, start_s = 0, 0
                 if image.shape[0] < self.data_args.num_frames or len(image.shape)==1:
                     if clip2:
                         return None
                     return random.choice(self)
-                if (self.data_args.clip_adapter or (data_type == 'video' and 'meta' in source)) and self.data_args.dataset == 'mad':
+                if (self.data_args.clip_adapter or (data_type == 'video' and 'meta' in source)) and self.data_args.dataset == 'mad' and not whole_video:
                     meta_start = source['meta']['token']['<s0>']
                     meta_end = source['meta']['token']['<e0>']
                     mad_feature_fps = self.data_args.feature_fps  # 30/16 if 'ego' in self.data_args.feat_folder else 5
@@ -938,6 +951,9 @@ class LazySupervisedDataset(Dataset):
                 else:
                     replace_set = []
                     for k, v in source['meta']['token'].items():
+                        if whole_video:
+                            replace_set.append((k, convert(source['meta']['duration'], v)))
+                            continue
                         if self.data_args.debug_window != 0:
                             duration = self.data_args.debug_window
                             if change_fps:

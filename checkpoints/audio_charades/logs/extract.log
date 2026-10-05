@@ -1,0 +1,5 @@
+extract_local charades: 8 workers on GPUs 0 1, media=data/charades/Charades_v1_480
+8 shard(s) -> data/chapters_audio/clip_l14_2fps_lmdb
+merged into data/chapters_audio/clip_l14_2fps_lmdb: +6672 new, 0 already present
+8 shard(s) -> data/chapters_audio/clap_1s_lmdb
+merged into data/chapters_audio/clap_1s_lmdb: +6672 new, 0 already present

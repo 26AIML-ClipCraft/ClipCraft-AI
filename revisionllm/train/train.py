@@ -70,7 +70,6 @@ class ModelArguments:
     dual_adapter: bool = field(default=False)
     # ---- ClipCraft audio branch ------------------------------------------------
     audio_fusion: bool = field(default=False, metadata={"help": "Add the CLAP additive-fusion branch."})
-    audio_dim: int = field(default=512)
     audio_gate_init: float = field(default=0.0, metadata={"help": "Initial value of the fusion gate alpha (0 => identity at step 0)."})
     audio_dropout: float = field(default=0.0)
     pretrain_audio_fusion: Optional[str] = field(default=None, metadata={"help": "non_lora_trainables.bin holding audio_fusion.* weights."})
@@ -270,6 +269,7 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args.audio_dim = data_args.audio_dim   # one --audio_dim flag (DataArguments) feeds the model too
     training_args.stream = data_args.stream
     data_args.clip_adapter = model_args.clip_adapter
     data_args.clip_adapter_feature = model_args.clip_adapter_feature

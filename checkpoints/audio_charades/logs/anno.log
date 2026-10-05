@@ -1,0 +1,25 @@
++ python revisionllm/data/audio_pipeline/charades_sta.py anno --sta_dir data/charades --clip_lmdb data/chapters_audio/clip_l14_2fps_lmdb --clap_lmdb data/chapters_audio/clap_1s_lmdb --out_dir data/charades
+train: 12408 queries in the txt, 12408 with features (5338 videos)
+test: 3720 queries in the txt, 3720 with features (1334 videos)
+wrote {'train': 12404, 'test': 3720}
++ python revisionllm/data/audio_pipeline/charades_sta.py replay_ids --candidates data/chapters_audio/subsets/train_sub_candidates_2500h.json --clip_lmdb data/chapters_audio/clip_l14_2fps_lmdb --clap_lmdb data/chapters_audio/clap_1s_lmdb --out data/charades/replay_ids.json
+125 replay videos (duration >= 1000s) of 1690 stored Train videos -> data/charades/replay_ids.json
++ python revisionllm/data/vidchap7m/chapters_to_activitynet.py --chapters_data_path data/chapters/chapters_vmr_train.jsonl --chapters_out_path data/charades/chapters_replay_anno.json --feat_lmdb data/chapters_audio/clip_l14_2fps_lmdb --ids data/charades/replay_ids.json
+  0%|          | 0/800676 [00:00<?, ?it/s] 17%|█▋        | 138168/800676 [00:00<00:00, 1381506.75it/s] 35%|███▍      | 276319/800676 [00:00<00:00, 1332924.94it/s] 58%|█████▊    | 464246/800676 [00:00<00:00, 1577504.17it/s] 83%|████████▎ | 663244/800676 [00:00<00:00, 1738369.46it/s]100%|██████████| 800676/800676 [00:00<00:00, 1698661.14it/s]
+1116 queries written to data/charades/chapters_replay_anno.json
++ cd revisionllm/data/feature_extraction
++ CUDA_VISIBLE_DEVICES=0
++ python chapters_clip_text_extractor.py --chapters_dir ../../../data/chapters --splits train --key_style vid_idx --clip_path ../../../checkpoints/clip/ViT-L-14.pt --feature_output_path /home/minyoy/ClipCraft-AI/data/chapters_audio/clip_L14_text_features_train --ids /home/minyoy/ClipCraft-AI/data/charades/replay_ids.json
+125
+Build models...
+Loading CLIP models
+Evaluating:   0%|          | 0/3 [00:00<?, ?it/s]Evaluating:  33%|███▎      | 1/3 [00:02<00:04,  2.40s/it]Evaluating:  67%|██████▋   | 2/3 [00:05<00:02,  2.77s/it]Evaluating: 100%|██████████| 3/3 [00:05<00:00,  1.61s/it]Evaluating: 100%|██████████| 3/3 [00:05<00:00,  1.89s/it]
++ CUDA_VISIBLE_DEVICES=0
++ python revisionllm/data/audio_pipeline/charades_sta.py text --out_dir data/charades --clip_path checkpoints/clip/ViT-L-14.pt --qfeat_train data/chapters_audio/clip_L14_text_features_train --qfeat_test data/chapters_audio/clip_L14_text_features_test
+Loading CLIP models
+wrote 12404 query features -> data/chapters_audio/clip_L14_text_features_train
+wrote 3720 query features -> data/chapters_audio/clip_L14_text_features_test
++ python revisionllm/data/audio_pipeline/charades_sta.py mix --out_dir data/charades --replay_anno data/charades/chapters_replay_anno.json --replay_share 0.3 --out data/charades/charades_mix_train_anno.json
+mix: 12404 Charades + 1116 VidChapters replay queries (wanted 5316, pool 1116) = 13520; replay share 8.3%; videos replayed: 125
++ echo 'anno done'
+anno done

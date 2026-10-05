@@ -47,7 +47,7 @@ def inference(model, image, query_feats, query, tokenizer, visual_memory = None,
             input_ids,
             images=image.cuda() if torch.cuda.is_available() else image,
             audio_feats=(audio_feats.cuda() if (audio_feats is not None and torch.cuda.is_available()) else audio_feats),
-            iteration_step=(torch.tensor(int(iteration_step)) if iteration_step is not None else None),
+            iteration_step=(int(iteration_step) if iteration_step is not None else None),   # int, not a 0-d tensor: HF generate() repeat_interleave()s every tensor kwarg
             query_feats = query_feats,
             do_sample=True,
             temperature=0.05,

@@ -12,7 +12,7 @@ mkdir -p "$OUT"
 EXTRA=()
 if [[ $(row_is_audio "$ROW") == 1 ]]; then
   INIT=${INIT:-$CKPT/stageA_R2_seed$SEED}
-  EXTRA=("${AUDIO_ARGS[@]}" --tune_audio_fusion True --audio_lr_multiplier 10
+  EXTRA=("${AUDIO_ARGS[@]}" --tune_audio_fusion True --audio_lr_multiplier 10 --audio_gate_init ${GATE_INIT:-0.1}
          --modality_dropout_visual ${MD_VISUAL:-0.15} --modality_dropout_audio ${MD_AUDIO:-0.15})
 else
   INIT=${INIT:-$PUBLIC_STAGE2}

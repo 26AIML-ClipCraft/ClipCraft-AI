@@ -75,6 +75,11 @@ def extract_mad_text_feature(args):
         else:
             data = json.load(open(filename))
         total_data.extend(data)
+    if args.ids:
+        # ClipCraft: encode only the queries of the evaluated/trained videos. val/test rows carry a chapter-index prefix
+        # in 'vid' ("<index><11-char id>"), the YouTube id is always the last 11 characters.
+        keep = set(json.load(open(args.ids)))
+        total_data = [d for d in total_data if d['vid'][-11:] in keep]
     print(len(total_data))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Build models...")
@@ -139,5 +144,7 @@ if __name__ == '__main__':
     parser.add_argument("--key_style", choices=["vid_idx", "qid"], default="vid_idx",
                         help="LMDB key: '<vid>_<j>' for train annotations (chapters_to_activitynet.py) or the "
                              "record's qid for test/val annotations (chapters_test_to_activitynet.py)")
+    parser.add_argument("--ids", default=None, help="JSON list of YouTube ids to keep (e.g. subsets/train_sub.json); "
+                                                    "default: every query of the split")
     args = parser.parse_args()
     extract_mad_text_feature(args)

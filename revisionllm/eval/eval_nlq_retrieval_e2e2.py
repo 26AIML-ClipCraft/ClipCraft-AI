@@ -461,6 +461,8 @@ def eval(args):
         except:
             #if args.debug:
                 #raise
+            if len(errors) < 3:  # ClipCraft: show why queries fail instead of silently dropping them
+                import traceback; traceback.print_exc()
             errors.append(id)
     print('errors', errors)
 

@@ -40,6 +40,11 @@ def parse_args():
     return args
 
 
+def youtube_id(vid):
+    # val/test rows are one per query and 'vid' is "<chapter index><11-char YouTube id>"
+    return vid[-11:]
+
+
 def convert_ego_to_vtimellm(ego_data, keep_ids=None):
     #{"1050": {"movie": "3003_40_YEAR_OLD_VIRGIN",
              # "sentence": "He enters a store called Smart Tech carrying his front bicycle tire and bag.",
@@ -47,10 +52,10 @@ def convert_ego_to_vtimellm(ego_data, keep_ids=None):
              # "movie_duration": 7947.6
     ego_to_activity = {}
     for first_dict in ego_data:
-        if keep_ids is not None and first_dict['vid'] not in keep_ids:
+        if keep_ids is not None and youtube_id(first_dict['vid']) not in keep_ids:
             continue
         second_dict = {}
-        second_dict['movie'] = first_dict['vid']   # ClipCraft: LMDB key == YouTube id
+        second_dict['movie'] = youtube_id(first_dict['vid'])   # ClipCraft: LMDB key == 11-char YouTube id
         second_dict['sentence'] = first_dict['query']
         second_dict['timestamps'] = first_dict['relevant_windows'][0]
         second_dict['movie_duration'] = first_dict['duration']

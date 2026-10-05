@@ -41,7 +41,15 @@ _darcs
 
 
 **/__pycache__
-checkpoints/
+# ---- ClipCraft: data and model weights stay out of git, run LOGS go in ------------------------------
+# (must stay below the global `log*` and `*.json` rules above: a later negation overrides them)
+/data/
+/checkpoints/**
+!/checkpoints/**/
+!/checkpoints/**/logs/
+!/checkpoints/**/logs/*.log
+!/checkpoints/*/stage*/train.log
+!/checkpoints/*/stage*/trainer_state.json
 .ipynb_checkpoints/
 wandb/
 revisionllm/eval/log/
