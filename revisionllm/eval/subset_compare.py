@@ -23,9 +23,16 @@ KW_RE = re.compile(r"(" + "|".join(re.escape(k) for k in AUDIO_KW) + ")", re.IGN
 THR = (0.3, 0.5, 0.7)
 
 
+GE = False   # --ge: count IoU >= threshold (ablation_report.py / report.sh); default: IoU > threshold (dense_metrics.py)
+
+
+def hit(t, x):
+    return (t >= x) if GE else (t > x)
+
+
 def metrics(top1):
     t = np.asarray(top1)
-    return {"n": len(t), "mIoU": t.mean() * 100, **{f"R1@{x}": (t > x).mean() * 100 for x in THR}}
+    return {"n": len(t), "mIoU": t.mean() * 100, **{f"R1@{x}": hit(t, x).mean() * 100 for x in THR}}
 
 
 def boot(a, b, n_boot, seed=0):
@@ -34,7 +41,7 @@ def boot(a, b, n_boot, seed=0):
     a, b = np.asarray(a), np.asarray(b)
     idx = rng.integers(0, len(a), size=(n_boot, len(a)))
     out = {}
-    for name, f in (("R1@0.5", lambda x: (x > 0.5).mean() * 100), ("mIoU", lambda x: x.mean() * 100)):
+    for name, f in (("R1@0.5", lambda x: hit(x, 0.5).mean() * 100), ("mIoU", lambda x: x.mean() * 100)):
         d = np.array([f(b[i]) - f(a[i]) for i in idx])
         out[name] = (f(b) - f(a), np.percentile(d, 2.5), np.percentile(d, 97.5))
     return out
@@ -46,9 +53,11 @@ def main():
     ap.add_argument("--row", action="append", required=True, help="NAME=path/to/result_dense.json")
     ap.add_argument("--compare", action="append", nargs=2, metavar=("BASE", "NEW"), default=[])
     ap.add_argument("--n_boot", type=int, default=2000)
+    ap.add_argument("--ge", action="store_true", help="R1@t counts IoU >= t (same as report.sh); default is IoU > t")
     ap.add_argument("--keywords", default=None, help="comma list overriding the built-in audio-cue keywords (regex fragments)")
     a = ap.parse_args()
-    global KW_RE
+    global KW_RE, GE
+    GE = a.ge
     if a.keywords:
         KW_RE = re.compile("(" + "|".join(k.strip() for k in a.keywords.split(",")) + ")", re.IGNORECASE)
     anno = json.load(open(a.anno))
