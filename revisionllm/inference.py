@@ -29,14 +29,29 @@ def inference(model, image, query_feats, query, tokenizer, visual_memory = None,
               audio_feats=None, iteration_step=None):
     if visual_memory is not None:
         query = query + '<memory>'
-    conv = conv_templates["v1"].copy()
-    conv.append_message(conv.roles[0], query)
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0)
-    input_ids = input_ids.repeat(image.shape[0], 1)
+    def _ids(q):
+        conv = conv_templates["v1"].copy()
+        conv.append_message(conv.roles[0], q)
+        conv.append_message(conv.roles[1], None)
+        return conv, tokenizer_image_token(conv.get_prompt(), tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+    attention_mask = None
+    if isinstance(query, (list, tuple)):
+        # ClipCraft multi-query: one prompt per batch row; shorter prompts are LEFT-padded (the model must run with
+        # config.tokenizer_padding_side = 'left', see VTimeLLMLlamaForCausalLM.prepare_inputs_for_generation).
+        assert len(query) == image.shape[0], "one prompt per row"
+        conv = _ids(query[0])[0]
+        ids = [_ids(q)[1] for q in query]
+        L = max(len(i) for i in ids)
+        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        input_ids = torch.stack([torch.cat([torch.full((L - len(i),), pad, dtype=i.dtype), i]) for i in ids])
+        attention_mask = torch.stack([torch.cat([torch.zeros(L - len(i), dtype=torch.long),
+                                                 torch.ones(len(i), dtype=torch.long)]) for i in ids])
+    else:
+        conv, ids = _ids(query)
+        input_ids = ids.unsqueeze(0).repeat(image.shape[0], 1)
     if torch.cuda.is_available():
         input_ids = input_ids.cuda()
+        attention_mask = attention_mask.cuda() if attention_mask is not None else None
 
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     keywords = [stop_str]
@@ -45,6 +60,7 @@ def inference(model, image, query_feats, query, tokenizer, visual_memory = None,
     with torch.inference_mode():
         model_output = model.generate(
             input_ids,
+            **({'attention_mask': attention_mask} if attention_mask is not None else {}),
             images=image.cuda() if torch.cuda.is_available() else image,
             audio_feats=(audio_feats.cuda() if (audio_feats is not None and torch.cuda.is_available()) else audio_feats),
             iteration_step=(int(iteration_step) if iteration_step is not None else None),   # int, not a 0-d tensor: HF generate() repeat_interleave()s every tensor kwarg
@@ -96,9 +112,9 @@ if __name__ == "__main__":
     disable_torch_init()
     tokenizer, model, context_len = load_pretrained_model(args, args.stage2, args.stage3)
     if torch.cuda.is_available():
-        model = model.cuda()
-    # model.get_model().mm_projector.to(torch.float16)
-    model.to(torch.float32)
+        model = model.bfloat16().cuda()   # fp32 7B (~27GB) does not fit a 24GB GPU
+    else:
+        model.to(torch.float32)
 
     clip_model, _ = clip.load(args.clip_path)
     clip_model.eval()
@@ -120,7 +136,7 @@ if __name__ == "__main__":
     images = images.to(torch.float32)
     with torch.no_grad():
         features = clip_model.encode_image(images.to('cuda')
-                    if torch.cuda.is_available() else images).to(torch.float32)
+                    if torch.cuda.is_available() else images).to(model.dtype)
 
     query = "describe the video."
     print("query: ", query)

@@ -29,3 +29,6 @@ soundfile                   # CLAP feature-extractor dependency in transformers
 anthropic>=1.0              # query-type labelling (label_query_types.py), optional
 gradio
 git+https://github.com/openai/CLIP.git
+psycopg[binary]>=3.1   # multi-query cache (revisionllm/multiquery)
+pgvector>=0.3
+matplotlib   # multi-query evaluation plots

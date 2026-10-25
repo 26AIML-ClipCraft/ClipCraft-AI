@@ -22,6 +22,9 @@ def load_pretrained_model(args, stage2=None, stage3=None, load_ckp=False):
     # ClipCraft: SDPA attention (torch>=2.x) replaces the flash-attn monkey patch.
     kwargs = {'torch_dtype': torch.float16,
               'attn_implementation': getattr(args, 'attn_implementation', 'sdpa')}
+    # ClipCraft: load (and merge LoRA) directly on GPU so peak host RAM stays small (e.g. g5.xlarge, 16GB).
+    if torch.cuda.is_available():
+        kwargs['device_map'] = 'cuda'
 
     # model_path = os.path.expanduser(args.model_path)
     model_base = args.model_base

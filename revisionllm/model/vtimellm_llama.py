@@ -56,6 +56,7 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         audio_feats: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
+            first_step = input_ids is not None and input_ids.shape[1] > 1
             (
                 input_ids,
                 position_ids,
@@ -77,6 +78,10 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
                 iteration_step,
                 audio_feats=(audio_feats.to(torch.float32) if self.device.type == 'cpu' and torch.is_tensor(audio_feats) else audio_feats),
             )
+            if first_step and not self.training and attention_mask is not None:
+                # ClipCraft: mask of the expanded prompt (<video> -> many positions). With left-padded batches of
+                # prompts of different length it marks the padding; generate() steps reuse it (see below).
+                self._gen_attention_mask = attention_mask
 
         return super().forward(
             input_ids=input_ids,
@@ -109,7 +114,11 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
                         else past_key_values[0][0].shape[-2])
         if past_len > 0:
             input_ids = input_ids[:, -1:]
-            kwargs["attention_mask"] = torch.ones(input_ids.shape[0], past_len + 1, dtype=torch.long, device=input_ids.device)
+            mask = torch.ones(input_ids.shape[0], past_len + 1, dtype=torch.long, device=input_ids.device)
+            prompt_mask = getattr(self, "_gen_attention_mask", None)
+            if prompt_mask is not None and prompt_mask.shape[0] == mask.shape[0] and prompt_mask.shape[1] <= past_len:
+                mask[:, :prompt_mask.shape[1]] = prompt_mask.to(mask.dtype)   # keep the prompt padding masked out
+            kwargs["attention_mask"] = mask
             kwargs.pop("position_ids", None)
 
         _inputs = super().prepare_inputs_for_generation(

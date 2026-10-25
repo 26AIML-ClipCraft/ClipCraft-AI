@@ -65,6 +65,7 @@ flowchart LR
 
 - 학습 항목 합계 **18,606개** = Charades 12,404 + 리플레이 3,101 + 리플레이의 부정 복제 3,101. 정답이 있는 항목 중 리플레이 비율은 20%(3,101/15,505).
 - 부정 복제는 같은 긴 영상에서 정답이 없는 창을 골라 "Not Present"를 정답으로 둔 샘플이다. Charades(약 30초, 창이 하나)에서는 부정 창을 만들 수 없어 부정 복제를 만들지 않는다.
+- **영상 보관 정책**: YouTube에서 받은 VidChapters 영상은 feature 추출 직후 삭제했다(Test 오디오 트랙 m4a만 백업). Charades 영상(압축 해제 11GB, 원본 zip 16GB)은 feature 추출과 학습·평가를 마친 뒤 삭제했다. feature와 주석만 남아 있으며, 재추출이나 새 사례 그림에는 공개 zip(Allen AI S3)을 다시 받아야 한다.
 - 리플레이를 1,000초 이상 영상으로 제한한 이유: 학습 로더에 1,000초 미만 VidChapters 영상용 별도 시간 환산 경로가 있는데, 이 실험의 feature(전 영상 2 fps)와 맞는지 확인하지 못해 확실한 경로만 썼다.
 - 리플레이 풀이 작은 이유: 계획했던 VidChapters 추출이 YouTube의 봇 차단으로 중단되어 저장된 Train 영상이 약 1,700개(그중 1,000초 이상은 125개)뿐이다.
 
@@ -82,7 +83,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  subgraph SRC["원본 영상 (feature만 저장, 영상은 보관하지 않음)"]
+  subgraph SRC["원본 영상 (feature를 추출해 LMDB에 저장)"]
     CH["Charades-STA train<br/>5,338 영상 · 12,404 query<br/>(Allen AI S3, 480p)"]
     VC["VidChapters-7M 일부<br/>125 영상(≥1,000초) · 1,116 query<br/>(YouTube 360p)"]
   end
