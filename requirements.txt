@@ -32,3 +32,4 @@ git+https://github.com/openai/CLIP.git
 psycopg[binary]>=3.1   # multi-query cache (revisionllm/multiquery)
 pgvector>=0.3
 matplotlib   # multi-query evaluation plots
+openai>=1.40   # scenario recommendation (revisionllm/editing)
