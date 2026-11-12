@@ -13,13 +13,13 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from revisionllm.editing.audio_events import EVENT_PROMPTS, AudioEventTagger
 from revisionllm.editing.config import EditConfig
-from revisionllm.editing.dataset import collate
+from revisionllm.editing.legacy.dataset import collate
 from revisionllm.editing.highlight import plan_highlight
 from revisionllm.editing.scenario_llm import ScenarioLLM, validate_scenario
 from revisionllm.editing.scoring import importance_curve
 from revisionllm.editing.shared import AVRepresentation, to_second_grid
 from revisionllm.editing.summarize import Segment, summarize
-from revisionllm.editing.univtg_head import AVUniVTG, HeadConfig, giou_1d, univtg_loss
+from revisionllm.editing.legacy.univtg_head import AVUniVTG, HeadConfig, giou_1d, univtg_loss
 
 CLASSES = list(EVENT_PROMPTS)
 
@@ -96,7 +96,7 @@ def test_collate_pads():
 
 
 def test_service_scores_follow_the_reference(tmp_path):
-    """highlight = rank(s + f) mixed with audio / motion; summary = rank(f) only (UniVTG inference_hl / inference_qfvs)."""
+    """highlight = rank(s + f) mixed with audio events; summary = rank(f) only (UniVTG inference_hl / inference_qfvs)."""
     from revisionllm.editing.service import EditingService
     av, tagger = make_av(), None
     tagger = make_tagger(av)
@@ -105,7 +105,7 @@ def test_service_scores_follow_the_reference(tmp_path):
     s[10], f[90] = 5.0, 5.0
     scorer = SimpleNamespace(predict=lambda a, q=None: {"saliency": s, "foreground": f}, version="v")
     svc = EditingService.__new__(EditingService)
-    svc.cfg, svc.scorer, svc._tagger = EditConfig(w_audio=0.0, w_motion=0.0, smooth_sec=1), scorer, tagger
+    svc.cfg, svc.scorer, svc._tagger = EditConfig(w_audio=0.0, smooth_sec=1), scorer, tagger
     imp_vs, _, parts_vs = svc._curves(av, "summary")
     imp_hl, _, parts_hl = svc._curves(av, "highlight")
     assert int(np.argmax(imp_vs)) == 90 and parts_vs["saliency_source"] == "head:f"           # f alone
@@ -128,7 +128,7 @@ def test_qwen_query_subprocess(tmp_path, monkeypatch):
 def test_dataset_video_level_query(tmp_path):
     import hashlib
     from revisionllm.data.audio_pipeline.lmdb_utils import LmdbWriter
-    from revisionllm.editing.dataset import ChapterAVDataset, joined_query
+    from revisionllm.editing.legacy.dataset import ChapterAVDataset, joined_query
     rng = np.random.default_rng(0)
     cw, aw = LmdbWriter(str(tmp_path / "clip"), 1 << 28), LmdbWriter(str(tmp_path / "clap"), 1 << 28)
     cw.put("v0", rng.normal(size=(400, 768))); aw.put("v0", rng.normal(size=(200, 512))); cw.close(); aw.close()
@@ -159,7 +159,7 @@ def test_dataset_video_level_query(tmp_path):
 
 
 def test_summarize_finds_the_scenes():
-    av, cfg = make_av(), EditConfig(n_scenes=3, min_segment_sec=5)
+    av, cfg = make_av(), EditConfig(n_scenes=3)
     tagger = make_tagger(av)
     events = tagger.probs(av)
     imp, parts = importance_curve(av, events, CLASSES, cfg)
@@ -168,18 +168,23 @@ def test_summarize_finds_the_scenes():
     assert 1 <= len(segs) <= 3
     assert all(a.end <= b.start + 1e-6 for a, b in zip(segs, segs[1:])) and [s.id for s in segs] == list(range(len(segs)))
     assert all(0 <= s.start < s.end <= av.duration and s.key_times for s in segs)
-    cuts = {s.start for s in segs} | {s.end for s in segs}
-    assert {40.0, 80.0} & cuts                                    # a boundary lands on a real scene change
+    win = cfg.window_sec(av.duration)
+    assert all(abs((s.end - s.start) - win) < win / 2 + 1e-6 or s.end == av.duration for s in segs)   # fixed-length windows
+
+
+def test_window_grows_with_the_video():
+    cfg = EditConfig()
+    assert [cfg.window_sec(d) for d in (60, 359, 360, 1199, 1200, 3600)] == [12, 12, 20, 20, 30, 30]
 
 
 def test_highlight_prefers_laughter_and_respects_budget():
-    av, cfg = make_av(), EditConfig(w_saliency=0.0, w_motion=0.0, w_audio=1.0, highlight_min_sec=10, highlight_max_sec=20)
+    av, cfg = make_av(), EditConfig(w_saliency=0.0, w_audio=1.0, highlight_min_sec=10, highlight_max_sec=20)
     tagger = make_tagger(av)
     events = tagger.probs(av)
     imp, _ = importance_curve(av, events, CLASSES, cfg)
     clips = plan_highlight(imp, events, CLASSES, av.duration, cfg)
     assert clips and any(c["start"] <= 58 < c["end"] for c in clips)
-    assert sum(c["end"] - c["start"] for c in clips) <= 20 + cfg.clip_max_sec
+    assert sum(c["end"] - c["start"] for c in clips) <= 20 + cfg.window_sec(av.duration)
     assert all(a["end"] <= b["start"] for a, b in zip(clips, clips[1:]))
 
 
@@ -216,8 +221,8 @@ def test_scenario_only_uses_existing_segments():
         {"order": 3, "segment_id": 9, "start": 0, "end": 5, "description": "made up", "reason": "r"}]}
     client = FakeClient(raw)
     out = ScenarioLLM(EditConfig(), client).recommend(segs3(), 120.0, goal="short vlog")
-    assert [s["segment_id"] for s in out["scenes"]] == [1, 0] and [s["order"] for s in out["scenes"]] == [1, 2]
-    assert out["scenes"][0]["start"] == 40 and out["scenes"][0]["end"] == 80          # clamped into segment 1
+    assert [s["segment_id"] for s in out["scenes"]] == [0, 1] and [s["order"] for s in out["scenes"]] == [1, 2]   # sorted by time, not by the LLM order
+    assert out["scenes"][1]["start"] == 40 and out["scenes"][1]["end"] == 80          # clamped into segment 1
     model, messages, kw = client.requests[0]
     assert model == "gpt-4o-mini" and kw["response_format"] == {"type": "json_object"}
     assert "short vlog" in messages[1]["content"] and "joke" in messages[1]["content"]

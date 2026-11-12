@@ -30,9 +30,10 @@ def main():
     ap.add_argument("--seconds", type=float, help="target length of the scenario / highlight")
     ap.add_argument("--out", help="highlight video path (omit to only print the plan)")
     ap.add_argument("--head", default=EditConfig.head_ckpt, help="trained head checkpoint; missing -> training-free saliency")
-    ap.add_argument("--scorer", choices=["head", "univtg"], default="head",
-                    help="head: the AV head trained here (default); univtg: released UniVTG on the cached CLIP-L/14 features through the "
-                         "aligned Adapter (checkpoints/univtg/); needs a title or the Qwen description as its text query")
+    ap.add_argument("--scorer", choices=["head", "univtg"], default=None,
+                    help="univtg (default, or $CLIPCRAFT_SCORER): released UniVTG on the cached CLIP-L/14 features through the aligned "
+                         "Adapter (checkpoints/univtg/); needs a title or the Qwen description as its text query. "
+                         "head: the AV head trained in this repository (checkpoints/editing_head/)")
     ap.add_argument("--model", help="OpenAI model (default $CLIPCRAFT_OPENAI_MODEL or gpt-4o-mini)")
     ap.add_argument("--query_batch", type=int, default=8)
     ap.add_argument("--title", help="video title: the text query of the head. Without it a local Qwen VLM describes the video")
@@ -43,15 +44,9 @@ def main():
     cache_cfg, cfg = make_cfg(a), EditConfig(head_ckpt=a.head)
     if a.model:
         cfg.openai_model = a.model
-    scorer = None
-    if a.scorer == "univtg":
-        from revisionllm.editing.univtg.scorer import UniVTGScorer
-        scorer = UniVTGScorer()
-    elif a.head and os.path.exists(a.head):
-        from revisionllm.editing.univtg_head import HeadScorer
-        scorer = HeadScorer(a.head)
-    else:
-        print(f"[editing] no head checkpoint at {a.head}: using training-free saliency (representativeness)")
+    from revisionllm.editing.scorers import make_scorer
+    scorer = make_scorer(a.scorer, a.head)
+    print(f"[editing] scorer: {type(scorer).__name__}")
 
     from revisionllm.editing.db import EditDB
     db = EditDB(cache_cfg.dsn, cache_cfg.embedding_dim)               # one connection for caches and edit results

@@ -16,10 +16,10 @@ def target_seconds(duration: float, cfg, requested: float = None) -> float:
 
 def plan_highlight(importance: np.ndarray, events: np.ndarray, classes, duration: float, cfg, target_sec: float = None) -> List[Dict]:
     """Greedy peak picking on the importance curve. Each pick grows around its peak while the curve stays above 60% of the
-    peak value (between clip_min_sec and clip_max_sec); picks keep clip_gap_sec apart. Returned in time order, touching clips merged."""
+    peak value (between clip_min_sec and cfg.window_sec(duration), which grows with the video length); picks keep clip_gap_sec apart. Returned in time order, touching clips merged."""
     T = len(importance)
     budget = target_seconds(duration, cfg, target_sec)
-    cmin, cmax = int(cfg.clip_min_sec), int(cfg.clip_max_sec)
+    cmin, cmax = int(cfg.clip_min_sec), int(cfg.window_sec(duration))
     curve = smooth(importance, 3)
     taken = np.zeros(T, dtype=bool)
     clips, total = [], 0.0

@@ -19,7 +19,7 @@ from revisionllm.editing.audio_events import EVENT_PROMPTS, AudioEventTagger, pr
 from revisionllm.editing.config import EditConfig
 from revisionllm.editing.db import EditDB
 from revisionllm.editing.highlight import plan_highlight, render_highlight, target_seconds
-from revisionllm.editing.scenario_llm import ScenarioLLM
+from revisionllm.editing.scenario_llm import SCENARIO_SYSTEM, ScenarioLLM
 from revisionllm.editing.scoring import importance_curve, rank_norm, smooth
 from revisionllm.editing.shared import AVRepresentation
 from revisionllm.editing.summarize import Segment, summarize
@@ -99,8 +99,16 @@ class EditingService:
         head = self.scorer.version if self.scorer else "none"
         return params_key(av.feature_version, head, cfg, *extra)
 
+    def _source_label(self, task: str) -> str:
+        """Which model the saliency curve came from (stored in the plan; the cached plan's label is overwritten on read)."""
+        if self.scorer is None:
+            return "representativeness"
+        if getattr(self.scorer, "uses_text", False):
+            return "univtg-adapter:saliency"
+        return "head:s+f" if task == "highlight" else "head:f"
+
     def _curves(self, av, task: str, query=None, qtext: Optional[str] = None):
-        """task 'highlight': head score s + f (reference main/inference_hl.py, eval_mode=add) mixed with audio events and motion.
+        """task 'highlight': head score s + f (reference main/inference_hl.py, eval_mode=add) mixed with audio events.
         task 'summary': head score f only (reference inference_qfvs.py picks the top clips by the foreground score).
         Without a head both use the training-free representativeness stand-in."""
         events = self.tagger.probs(av)
@@ -117,6 +125,7 @@ class EditingService:
         else:
             imp = rank_norm(smooth(head["foreground"], self.cfg.smooth_sec))
             parts = {"saliency_source": "head:f"}
+        parts["saliency_source"] = self._source_label(task) if head is not None else parts["saliency_source"]
         return imp, events, parts
 
     # ---- 1. Scenario Grounding ------------------------------------------------------------------------------
@@ -143,14 +152,15 @@ class EditingService:
         av = self.representation(video_path)
         segs = self.summary(video_path, title)
         for s in segs:                                    # captions are per segment, so a changed goal does not redo them
-            ck = params_key(av.feature_version, "caption", s.start, s.end, s.key_times, self.cfg.openai_model, self.cfg.language)
+            ck = params_key(av.feature_version, "caption", s.start, s.end, s.key_times, self.cfg.openai_model, self.cfg.language,
+                            self.cfg.frame_max_side, self.cfg.frame_detail)
             cap = self.db.get_result(av.video_id, "caption", ck)
             if cap is None:
                 cap = self.llm.caption(video_path, s)
                 self.db.put_result(av.video_id, "caption", ck, cap)
             s.caption = cap
         sk = params_key(self._key(av, "scenario"), [s.to_dict() for s in segs], goal, target_sec, self.cfg.openai_model,
-                        self.cfg.language)
+                        self.cfg.language, SCENARIO_SYSTEM)
         out = self.db.get_result(av.video_id, "scenario", sk)
         if out is None:
             out = self.llm.recommend(segs, av.duration, goal, target_sec)
@@ -171,6 +181,7 @@ class EditingService:
             plan = {"target_sec": target_seconds(av.duration, self.cfg, target_sec), "saliency_source": parts["saliency_source"],
                     "query": qtext, "clips": clips}
             self.db.put_result(av.video_id, "highlight", key, plan)
+        plan = {**plan, "saliency_source": self._source_label("highlight")}     # cached plans may carry an older label
         if out_path:
             render_highlight(video_path, plan["clips"], out_path, av.has_audio)
             plan = {**plan, "output": out_path}

@@ -1,7 +1,7 @@
 """Does the trained head change the highlight / summary compared with the training-free curve? Runs on the held-out videos of
 the cached LMDBs (no video files needed) and prints, per method, how the selected seconds look.
 
-  python revisionllm/editing/compare_head.py --anno data/chapters/chapters_vmr_train.jsonl \
+  python revisionllm/editing/legacy/compare_head.py --anno data/chapters/chapters_vmr_train.jsonl \
       --clip_lmdb data/chapters_audio/clip_l14_2fps_lmdb --clap_lmdb data/chapters_audio/clap_1s_lmdb
 """
 import argparse
@@ -18,12 +18,12 @@ sys.path.append(ROOT)
 from revisionllm.data.audio_pipeline.lmdb_utils import loads_npz
 from revisionllm.editing.audio_events import EVENT_PROMPTS, AudioEventTagger, prompt_embeddings
 from revisionllm.editing.config import EditConfig
-from revisionllm.editing.dataset import ChapterAVDataset, embed_titles
+from revisionllm.editing.legacy.dataset import ChapterAVDataset, embed_titles
 from revisionllm.editing.highlight import plan_highlight, target_seconds
 from revisionllm.editing.scoring import importance_curve, rank_norm, smooth, visual_change
 from revisionllm.editing.shared import AVRepresentation, to_second_grid
 from revisionllm.editing.summarize import summarize
-from revisionllm.editing.univtg_head import HeadScorer
+from revisionllm.editing.legacy.univtg_head import HeadScorer
 from revisionllm.multiquery.config import CacheConfig
 
 

@@ -17,7 +17,14 @@ SCENARIO_SYSTEM = (
     "scenario for the result. Use ONLY the given segment ids and never invent scenes that are not in the list. You may reorder "
     "segments and trim a segment inside its own time range. Reply with JSON only: "
     '{{"title": str, "summary": str, "scenes": [{{"order": int, "segment_id": int, "start": float, "end": float, '
-    '"description": str, "reason": str}}]}}. Write text fields in {language}.')
+    '"description": str, "reason": str}}]}}. Write text fields in {language}. '
+    "STYLE: title and description are short title-like phrases, not sentences: a noun phrase or a noun-ended phrase of roughly "
+    "10-25 characters, never ending with a period or any punctuation. Describe what is visibly happening (who, what). Good "
+    "descriptions: '양념 재료 손으로 버무리기', '이민호, 복도에서 마주친 놀란 표정', '탕수육 소스 완성과 시식 평가'. "
+    "The reason is different: write it as one friendly, easy sentence in polite spoken Korean (해요체) addressed to the person who is "
+    "making the video, about 20-40 characters, explaining in plain words what this scene gives the viewer (e.g. what they will see, feel or learn) "
+    "and why it is worth keeping. No jargon (no 'narrative', 'composition', 'transition'), no trailing period, "
+    "and it must be different for every scene; never copy wording from these instructions. Do not guess facts that the captions do not state.")
 
 
 def grab_frame(video_path: str, t: float, max_side: int = 512) -> bytes:
@@ -26,9 +33,9 @@ def grab_frame(video_path: str, t: float, max_side: int = 512) -> bytes:
     return subprocess.run(cmd, capture_output=True, check=True).stdout
 
 
-def _image_part(jpeg: bytes) -> dict:
+def _image_part(jpeg: bytes, detail: str = "low") -> dict:
     return {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode(),
-                                               "detail": "low"}}
+                                               "detail": detail}}
 
 
 def make_client():
@@ -56,7 +63,7 @@ class ScenarioLLM:
     def caption(self, video_path: str, seg) -> str:
         tags = ", ".join(seg.tags) or "none"
         text = CAPTION_PROMPT.format(start=f"{seg.start:.0f}s", end=f"{seg.end:.0f}s", tags=tags, language=self.cfg.language)
-        content = [{"type": "text", "text": text}] + [_image_part(grab_frame(video_path, t)) for t in seg.key_times]
+        content = [{"type": "text", "text": text}] + [_image_part(grab_frame(video_path, t, self.cfg.frame_max_side), self.cfg.frame_detail) for t in seg.key_times]
         return self._chat([{"role": "user", "content": content}]).strip()
 
     def recommend(self, segments, duration: float, goal: Optional[str] = None, target_sec: Optional[float] = None) -> dict:
@@ -78,8 +85,13 @@ class ScenarioLLM:
         raise RuntimeError("unreachable")
 
 
+def _clean(x) -> str:
+    """Title-like text: no trailing period / sentence punctuation."""
+    return str(x).strip().rstrip(".。!?\u2026 ")
+
+
 def validate_scenario(raw: dict, segments) -> dict:
-    """Keep scenes that point at a real segment, clamp their trim to that segment, renumber in the proposed order."""
+    """Keep scenes that point at a real segment, clamp their trim to that segment, sort chronologically and renumber."""
     by_id = {s.id: s for s in segments}
     scenes = []
     for sc in sorted(raw.get("scenes", []), key=lambda x: x.get("order", 0)):
@@ -90,10 +102,11 @@ def validate_scenario(raw: dict, segments) -> dict:
         e = min(max(float(sc.get("end", seg.end)), seg.start), seg.end)
         if e - s < 1.0:
             s, e = seg.start, seg.end
-        scenes.append({"segment_id": seg.id, "start": s, "end": e, "description": str(sc.get("description", "")),
-                       "reason": str(sc.get("reason", ""))})
+        scenes.append({"segment_id": seg.id, "start": s, "end": e, "description": _clean(sc.get("description", "")),
+                       "reason": _clean(sc.get("reason", ""))})
     if not scenes:
         raise ValueError("the model proposed no scene that exists in the video")
+    scenes.sort(key=lambda sc: (sc["start"], sc["end"]))  # chronological, regardless of the order the model proposed
     for n, sc in enumerate(scenes, 1):
         sc["order"] = n
-    return {"title": str(raw.get("title", "")), "summary": str(raw.get("summary", "")), "scenes": scenes}
+    return {"title": _clean(raw.get("title", "")), "summary": str(raw.get("summary", "")), "scenes": scenes}

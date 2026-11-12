@@ -1,6 +1,6 @@
 """Train the audio-visual UniVTG-style head on the cached VidChapters CLIP-L/14 + CLAP features. Reads LMDBs only.
 
-  python revisionllm/editing/train_head.py \
+  python revisionllm/editing/legacy/train_head.py \
       --train_anno data/chapters/chapters_vmr_train.jsonl --val_anno data/chapters/chapters_vmr_val.jsonl \
       --clip_lmdb data/chapters_audio/clip_l14_2fps_lmdb --clap_lmdb data/chapters_audio/clap_1s_lmdb \
       --out checkpoints/editing_head/head.pt
@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 sys.path.append(ROOT)
 
-from revisionllm.editing.dataset import ChapterAVDataset, collate, embed_titles
-from revisionllm.editing.univtg_head import AVUniVTG, HeadConfig, save_head, univtg_loss
+from revisionllm.editing.legacy.dataset import ChapterAVDataset, collate, embed_titles
+from revisionllm.editing.legacy.univtg_head import AVUniVTG, HeadConfig, save_head, univtg_loss
 from revisionllm.multiquery.config import CacheConfig
 
 

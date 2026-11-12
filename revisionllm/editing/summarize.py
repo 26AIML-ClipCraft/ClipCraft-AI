@@ -21,39 +21,23 @@ class Segment:
         return asdict(self)
 
 
-def _boundaries(x: np.ndarray, n_seg: int, min_len: int, win: int) -> List[int]:
-    """Change points: seconds where the mean feature of the next `win` seconds differs most from the previous `win`."""
-    T = len(x)
-    cs = np.vstack([np.zeros((1, x.shape[1])), np.cumsum(x, 0)])
-    idx = np.arange(1, T)
-    lo, hi = np.maximum(idx - win, 0), np.minimum(idx + win, T)
-    prev = (cs[idx] - cs[lo]) / (idx - lo)[:, None]
-    nxt = (cs[hi] - cs[idx]) / (hi - idx)[:, None]
-    cos = (prev * nxt).sum(1) / np.maximum(np.linalg.norm(prev, axis=1) * np.linalg.norm(nxt, axis=1), 1e-8)
-    nov = 1.0 - cos
-    chosen: List[int] = []
-    for j in np.argsort(-nov):
-        t = int(idx[j])
-        if t < min_len or T - t < min_len or any(abs(t - c) < min_len for c in chosen):
-            continue
-        chosen.append(t)
-        if len(chosen) >= n_seg - 1:
-            break
-    return sorted(chosen)
+def _fixed_spans(T: int, win: int) -> List[tuple]:
+    """Cut [0, T) into windows of `win` seconds; a leftover shorter than half a window joins the last window."""
+    edges = list(range(0, T, win)) + [T]
+    if len(edges) > 2 and T - edges[-2] < win / 2:
+        edges.pop(-2)
+    return list(zip(edges[:-1], edges[1:]))
 
 
 def summarize(av, importance: np.ndarray, events: np.ndarray, classes, cfg) -> List[Segment]:
-    """Over-segment at feature change points (2x the wanted count), then pick `cfg.n_scenes` by importance with
-    maximal-marginal-relevance so the picks are different scenes. Returned in time order."""
+    """Cut the video into fixed windows (length grows with the video, see EditConfig.window_sec), then pick `cfg.n_scenes`
+    by importance with maximal-marginal-relevance so the picks are different scenes. Returned in time order."""
     T = len(av)
     end_all = min(float(T), av.duration) if av.duration > 0 else float(T)
-    min_len = max(int(cfg.min_segment_sec), 1)
-    n_want = max(1, min(cfg.n_scenes, T // min_len))
+    spans = _fixed_spans(T, max(int(round(cfg.window_sec(end_all))), 1))
+    n_want = max(1, min(cfg.n_scenes, len(spans)))
     x = av.vision if not av.has_audio else np.hstack([av.vision, 0.5 * av.audio])
     x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-8)
-    cuts = _boundaries(x, min(2 * n_want, max(T // min_len, 1)), min_len, win=int(np.clip(T // 100, 3, 15)))
-    edges = [0] + cuts + [T]
-    spans = list(zip(edges[:-1], edges[1:]))
 
     cent, imp = [], []
     for s, e in spans:
@@ -77,11 +61,16 @@ def summarize(av, importance: np.ndarray, events: np.ndarray, classes, cfg) -> L
         p = events[s:e].mean(0)
         tags = {classes[i]: round(float(p[i]), 3) for i in np.argsort(-p)[:2] if p[i] > 0.15}
         peak = s + int(np.argmax(importance[s:e]))
-        keys = [(s + e) / 2.0, peak + 0.5]
+        n_key = int(min(cfg.frames_per_segment, max(2, np.ceil((e - s) / cfg.key_every_sec))))
+        keys = [s + (e - s) * (i + 0.5) / n_key for i in range(n_key)] + [peak + 0.5]   # evenly spread + importance peak
         keys = [round(min(t, end_all), 2) for t in keys]
         uniq = []
         for t in keys:                                    # drop a key frame that is (almost) the same moment
             if all(abs(t - u) >= 2.0 for u in uniq):
                 uniq.append(t)
-        segs.append(Segment(n, float(s), float(min(e, end_all)), round(imp[k], 4), tags, uniq[: cfg.frames_per_segment]))
+        uniq = sorted(uniq)
+        if len(uniq) > cfg.frames_per_segment:            # keep evenly spaced ones when over the cap
+            idx = np.linspace(0, len(uniq) - 1, cfg.frames_per_segment).round().astype(int)
+            uniq = [uniq[i] for i in idx]
+        segs.append(Segment(n, float(s), float(min(e, end_all)), round(imp[k], 4), tags, uniq))
     return segs

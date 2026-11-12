@@ -1,50 +1,166 @@
-# 시나리오 추천 + 하이라이트 추출 (공유 audio-visual 표현)
+# 하이라이트 추출 + 영상 요약 → 시나리오 추천
 
-`multiquery`의 `FeatureCache`가 만든 CLIP ViT-L/14 + CLAP feature를 1초 격자의 `AVRepresentation`으로 묶어
-Scenario Grounding / Scenario Recommendation / Highlight Extraction이 함께 읽는다. 영상 인코딩은 파일당 한 번이다.
+그림: `docs/diagrams/highlight_pipeline.png`, `docs/diagrams/summary_pipeline.png` (draw.io: 같은 이름 `.drawio`)
+
+## 1. 왜 만들었나 (개발 목적)
+
+기존 시스템은 영상 검색·편집을 위해 CLIP 기반 영상 feature를 미리 뽑아 캐시해 둔다. 이 캐시를 그대로 활용해, **별도의 feature 추출 없이**
+영상에서 중요한 장면을 찾는 **하이라이트 추출**과 **영상 요약 → 편집 시나리오 추천** 기능을 추가하려 했다.
+
+- 하이라이트: 영상 전체에서 중요한 구간 몇 개를 골라 짧은 영상 하나로 이어 붙인다.
+- 요약 → 시나리오: 영상을 대표하는 장면 8곳을 고르고, 장면마다 설명과 추천 이유를 붙인 편집 순서(시나리오)를 만든다.
+
+영상의 "중요도"는 UniVTG로 시간별 점수를 계산한다. 그 위에 기존 캐시에 있던 CLAP 오디오 feature를 결합해 소리 정보까지 쓴다.
+
+## 2. 어떻게 구현했나
+
+### 2-1. 공통: UniVTG + Adapter로 초당 saliency 만들기 (`univtg/scorer.py`)
+
+UniVTG 공개 모델은 CLIP ViT-B/32(512-d) feature를 입력으로 쓰는데, 캐시에는 ViT-L/14(768-d)가 들어 있다. 둘은 차원도 공간도 달라 그대로 넣을 수 없다.
+그래서 **Linear Adapter(768→512) 한 층**만 학습해 L/14 공간을 UniVTG의 B/32 공간으로 옮겼다. UniVTG와 CLIP은 고정(frozen)이다.
+
+```
+캐시된 L/14 feature (1 s, 768-d)
+  → 연속 2초 평균 + L2             … UniVTG가 쓰는 2초 클립 단위
+  → Linear Adapter 768→512        … 학습한 부분은 이것뿐 (Charades로 학습)
+  → UniVTG (공개 가중치, 고정)      … 쿼리 = 영상 제목 텍스트(CLIP-B/32)
+  → saliency = cosine(영상 토큰, pooled 쿼리)  … 클립당 1개, 1초 격자로 복제
+```
+
+쿼리는 영상 제목이다. 제목이 없으면 로컬 Qwen3-VL이 프레임 8장으로 만든 한 문장 설명을 쓴다.
+체크포인트와 선택 근거는 `checkpoints/univtg/README.md`.
+
+### 2-2. 하이라이트 (`scoring.py`, `highlight.py`)
+
+UniVTG는 시각 정보만 쓰므로, **CLAP 오디오 점수를 늦게 합치는 방식(late fusion)** 으로 소리 정보를 더했다. 학습은 하지 않는다.
+
+1. 초당 오디오 점수 A: 기존 CLAP feature와 텍스트 프롬프트의 유사도로 말·음악·웃음·박수·주변음·무음 확률을 구하고, 소리 종류별 가중치
+   (laughter 1.0, applause 1.0, music 0.6, speech 0.5, ambient 0.1, silence −0.5)로 한 점수를 만든다.
+2. 초당 saliency S: 2-1의 UniVTG 점수.
+3. 두 점수를 각각 3초 평활 후 영상 안의 순위(0~1)로 바꿔 가중합한다. 오디오 트랙이 없으면 S만 쓴다.
+
+```
+하이라이트 점수 = 0.7 × S (UniVTG saliency) + 0.3 × A (오디오 이벤트)
+```
+
+4. 점수가 높은 지점부터 클립을 잡는다. 피크에서 시작해 점수가 피크의 60 % 아래로 떨어질 때까지(최소 3초) 양옆으로 늘리되, **윈도우 길이 W까지만** 늘린다(동적 확장).
+   클립 사이는 2초 이상 띄우고, 합계가 영상 길이의 10 %(15~60초)가 될 때까지 반복한다. 붙어 있는 클립은 합치고 ffmpeg로 이어 붙인다.
+
+### 2-3. 영상 요약 → 시나리오 추천 (`summarize.py`, `scenario_llm.py`)
+
+영상 요약은 **UniVTG saliency만** 쓴다(오디오는 섞지 않는다).
+
+1. 영상을 **고정 길이 윈도우(W초)** 로 자른다. W는 영상 길이에 따른 표로 정한다(하이라이트의 최대 클립 길이와 같은 값).
+
+   | 영상 길이 | W |
+   |---|---|
+   | 6분 미만 | 12초 |
+   | 20분 미만 | 20초 |
+   | 20분 이상 | 30초 |
+
+   마지막 조각이 W의 절반보다 짧으면 앞 윈도우에 합친다.
+2. 윈도우마다 두 값을 만든다.
+   - **중요도 I**: 초별 중요도(saliency를 3초 평활 후 영상 전체 순위로 변환)에서 윈도우 안 상위 절반의 평균을 구하고, 윈도우끼리 다시 순위 정규화한다.
+   - **내용 벡터**: 윈도우 안 `[CLIP ; 0.5·CLAP]` 1초 벡터의 평균(정규화).
+3. **MMR**로 8개를 고른다: `0.7 × I − 0.3 × (이미 고른 윈도우들과의 최대 코사인 유사도)`. 중요하면서 서로 다른 장면이 뽑히도록 하는 장치다. 결과는 시간순.
+4. 윈도우마다 키프레임(약 8초당 1장, 2~5장 + 중요도 피크 프레임, 1024px, detail=high)을 GPT(gpt-4o-mini)에 보내 **캡션**을 만든다.
+5. 캡션과 시간을 한 번에 GPT에 보내 시나리오 JSON(제목·요약·장면별 설명·추천 이유)을 받는다.
+   코드에서 존재하지 않는 구간은 버리고, 시간순으로 정렬하고, 구간을 해당 윈도우 안으로 잘라 넣는다.
+
+### 2-4. 파일
 
 | 파일 | 역할 |
 | --- | --- |
 | `shared.py` | 캐시 feature → 1초 격자 `AVRepresentation` |
-| `univtg_head.py` | UniVTG 구조(saliency / foreground / boundary offset)를 CLIP-L + CLAP 위에 재구현. 손실·계수는 레퍼런스(`showlab/UniVTG`)를 따름 |
-| `dataset.py`, `train_head.py` | 캐시 LMDB만 읽어 학습(추출 없음). 챕터 구간·제목에서 UniVTG식 unified label 생성 |
-| `audio_events.py` | CLAP zero-shot 이벤트(speech/music/laughter/applause/ambient/silence) |
-| `scoring.py` | saliency + 오디오 이벤트 + 시각 변화 → 초당 중요도 |
-| `summarize.py` | 변화점 분할 + MMR로 대표 구간 선택(시간, 오디오 태그, 키프레임) |
-| `scenario_llm.py` | gpt-4o-mini: 구간 캡션(이미지) → 편집 순서/시나리오 JSON. 존재하지 않는 구간은 버림 |
-| `highlight.py` | 중요도 피크로 클립 선택 후 ffmpeg로 이어붙임 |
-| `query_gen.py`, `qwen_describe.py` | 제목이 없을 때 로컬 Qwen3-VL-8B(기본, `--vlm_model`로 Qwen2.5-VL 선택 가능)가 프레임 8장으로 한 문장 설명을 만들어 헤드의 텍스트 쿼리로 사용(영상당 1회, DB 캐시) |
+| `scorers.py` | saliency 스코어러 생성(`make_scorer`) |
+| `univtg/` | 공개 UniVTG 모델 코드 + `scorer.py`(Adapter를 거쳐 saliency 계산) |
+| `audio_events.py` | CLAP zero-shot 이벤트 확률 |
+| `scoring.py` | saliency + 오디오 → 초당 중요도 |
+| `highlight.py` | 중요도 피크로 클립 선택, ffmpeg로 이어붙임 |
+| `summarize.py` | 고정 윈도우 분할 + MMR 대표 구간 선택 |
+| `scenario_llm.py` | 구간 캡션(이미지) → 시나리오 JSON, 검증·정렬 |
+| `query_gen.py`, `qwen_describe.py` | 제목이 없을 때 로컬 Qwen이 만드는 텍스트 쿼리(영상당 1회, DB 캐시) |
 | `db.py`, `service.py`, `cli.py` | `edit_result` 테이블 캐시, 오케스트레이션, CLI |
+| `config.py` | 모든 설정(`EditConfig`): 가중치, 윈도우 표, 예산, 프레임 설정 등 |
 
-## 사용법
+### 2-5. 사용법
 ```bash
 export OPENAI_API_KEY=...  CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
-python revisionllm/editing/cli.py recommend --video X.mp4 --goal "1분 요약"
+python revisionllm/editing/cli.py recommend --video X.mp4 --goal "1분 요약" --title "제주 여행 브이로그"
 python revisionllm/editing/cli.py highlight --video X.mp4 --out X_hl.mp4 --title "제주 여행 브이로그"   # 제목이 없으면 Qwen이 설명 생성
-python revisionllm/editing/cli.py all --video X.mp4 --query "a person laughs" --out X_hl.mp4   # 7B 모델 로드
 ```
-헤드 학습(GPU, 아직 실행하지 않음):
-```bash
-python revisionllm/editing/train_head.py --train_anno data/chapters/chapters_vmr_train.jsonl \
-  --val_anno data/chapters/chapters_vmr_val.jsonl --clip_lmdb data/chapters_audio/clip_l14_2fps_lmdb \
-  --clap_lmdb data/chapters_audio/clap_1s_lmdb --out checkpoints/editing_head/head.pt
-```
+결과 캐시 키에는 설정·feature 버전·스코어러 버전이 들어가므로, 설정을 바꾸면 자동으로 다시 계산된다.
+LLM 캐시는 모델·언어·프롬프트·프레임 설정까지 키에 포함한다.
 
-## UniVTG 레퍼런스와의 대응 (레포를 읽고 맞춘 부분)
-- **하이라이트 점수** = saliency 점수 + foreground 로짓 (`main/inference_hl.py`, `eval_mode=add`). 여기에 오디오 이벤트·시각 변화를 섞는 것은 이 프로젝트의 확장.
-- **요약 점수** = foreground 로짓만 (`main/inference_qfvs.py`, `pred_logits`). 레퍼런스는 상위 클립을 바로 뽑지만 여기서는 변화점으로 나눈 구간 단위로 고르고(MMR) 시간·장면 내용을 구조화한다.
-- **손실** (`scripts/qvhl_pretrain.sh`): foreground = 배경 가중 0.1의 교차엔트로피(계수 10), saliency = 구간 안/밖 클립 쌍의 margin 1 랭킹(계수 0.05), 경계 = L1(10) + gIoU(1). 라벨은 `get_saliency_labels_sub_as_query`처럼 정답 구간에서 만든다.
-- **차이:** 레퍼런스는 사람이 만든 saliency 라벨과 영상 제목 쿼리로 학습한다. 여기에는 둘 다 없어서 영상 제목 대신 챕터 제목들을 이은 문장을 쿼리로 쓰고, 그 샘플은 챕터 제목과 가장 잘 맞는 상위 30% 초를 foreground로 쓴다(약한 대리 라벨). 경계 offset은 학습만 하고 두 기능에서는 쓰지 않는다(레퍼런스도 MR에서만 사용).
+## 3. 검증 결과
 
-## 쿼리 (헤드가 보는 텍스트)
-- 학습: 챕터 제목(70%, 구간 정답이 있는 쿼리) 또는 챕터 제목들을 이은 문장(30%, 영상 제목 대용). 쿼리 없는 모드는 두지 않는다.
-- 추론: `--title`이 있으면 그것, 없으면 Qwen3-VL-8B(`~/.cache/huggingface`)가 쓴 한 문장. Qwen3-VL은 transformers>=4.57이 필요해
-  이 환경(4.41.2) 대신 다른 환경의 python으로 서브프로세스 실행한다: `export CLIPCRAFT_VLM_PYTHON=~/miniconda3/envs/gazeqwen/bin/python`.
-- 헤드 체크포인트가 없으면 쿼리는 쓰지 않고 VLM도 부르지 않는다.
+검증한 것과 하지 못한 것을 구분해서 적는다.
 
-## 한계
-- 체크포인트가 없으면 saliency는 "영상 평균과의 유사도"(training-free)로 대체되고 결과에 `saliency_source`로 표시된다.
-- 학습 데이터에는 사람이 만든 하이라이트 라벨이 없다. saliency 타깃은 챕터 제목-프레임 CLIP 유사도라 약한 대리 신호이며,
-  그래서 최종 중요도는 오디오 이벤트·시각 변화와 섞는다(`EditConfig.w_*`). 품질은 학습 후 사람이 확인해야 한다.
-- 결과 캐시 키에 설정·feature_version·헤드 버전이 들어가므로 바뀌면 재계산된다. LLM 캐시는 모델/언어까지 포함.
-- 테스트: `pytest tests/test_editing.py` (DB 테스트는 `CLIPCRAFT_TEST_DSN` 필요). 학습·실영상·실제 GPT 호출은 검증하지 못했다.
+### 3-1. 모델 부분 (UniVTG + Adapter) — 정량
+상세 수치와 조건은 `checkpoints/univtg/README.md`.
+
+| 항목 | 결과 |
+|---|---|
+| 구현이 원본 UniVTG와 같은지 | 같은 가중치에서 **출력이 비트 단위로 일치** (`tests/test_univtg_scorer.py`) |
+| Adapter 학습 | Charades 검증 cosine **0.923** (선형 변환의 이론 상한 0.924) |
+| Adapter 때문에 나빠지는지 | TVSum(35개 영상, 하이라이트): 진짜 B/32 입력 대비 mAP@5 −0.016 [−0.071, +0.036], F1@15 % +0.008 [−0.015, +0.032] → **유의한 차이 없음**(신뢰구간이 넓어 작은 손실을 배제하지는 못함). Charades-STA(구간 안 적중 지표): Adapter 점수가 B/32 입력과 같거나 높았으나(hit@1 0.490 vs 0.471) 둘 사이의 검정은 하지 않음 |
+| 하이라이트 정확도 (TVSum 35개 영상, mAP@5) | UniVTG+Adapter saliency **0.580**. 비교: CLIP 제로샷 L/14(캐시 feature) 0.526, CLIP 제로샷 B/32 0.462, 무작위 0.427 |
+| 위 비교의 통계 검정 (paired bootstrap 95 % CI) | UniVTG(B/32 입력) − CLIP 제로샷 B/32: mAP +0.134 [+0.069, +0.196], **유의**. UniVTG+Adapter − CLIP 제로샷 L/14: mAP +0.055 [−0.000, +0.114], **유의하지 않음**(F1@15 %는 +0.025 [+0.002, +0.050]로 유의) |
+| saliency 단독 vs saliency+foreground 로짓 | mAP 0.580 vs 0.551 (유의성 검정은 하지 않음) |
+| 텍스트 인코더 | B/32 토큰 cosine이 UniVTG 공개 텍스트 feature와 1.0000 (B/16은 약 0) |
+
+### 3-2. 파이프라인 전체 — 코드 검증
+- `python -m pytest tests/test_editing.py tests/test_univtg_scorer.py` → **17 passed, 2 skipped** (skip은 DB 연결이 필요한 테스트).
+- 확인하는 내용: 시나리오는 존재하지 않는 구간을 버리고 시간순으로 정렬한다, 요약 윈도우 길이가 고정이고 영상 길이에 따라 표대로 변한다,
+  하이라이트가 예산을 지키고 오디오 점수가 높은 구간을 고른다, 설정이 바뀌면 캐시 키가 바뀐다.
+
+### 3-3. 실제 영상 4개 데모 (정성 + 수치)
+저장소 루트의 영상 4개(드라마·요리 영상 100~300초)에 전체 파이프라인을 돌렸다. 결과 화면은 `ClipCraft - Highlights.html`, 스크린샷은 `results/highlights/screenshots/`.
+
+| 영상 | 길이 | 하이라이트 | 합계(목표) | 요약 윈도우(W=12초) | 시나리오 장면 |
+|---|---|---|---|---|---|
+| 1 요리 | 298초 | 3곳 | 36초(29.8초) | 8개 선택 | 5장면 |
+| 2 요리 | 301초 | 3곳 | 36초(30.1초) | 8개 선택 | 8장면 |
+| 3 사극 | 102초 | 2곳 | 21초(15.0초) | 8개 선택 | 6장면 |
+| 4 드라마 | 214초 | 2곳 | 24초(21.4초) | 8개 선택 | 4장면 |
+
+- 모든 시나리오 장면이 영상 길이 안에 있고 시간순이었다.
+- 합계가 목표보다 큰 것은 클립이 W(12초) 단위라 마지막 클립이 목표를 넘기며 들어오기 때문이다.
+- 시나리오 장면 수는 GPT가 8개 윈도우 중 일부만 골라 쓰므로 영상마다 다르다.
+- 영상 4개 전체에서 GPT 호출은 34회(영상당 약 8~9회: 캡션 + 시나리오).
+
+**눈으로 확인한 품질**
+- 하이라이트: 선택된 구간의 가운데 프레임을 보고 이름을 붙였을 때 요리 영상은 재료 손질·튀김 클로즈업·플레이팅, 드라마 영상은 인물 표정이 뚜렷한 장면이 골라졌다.
+- 시나리오: 장면 순서와 시간은 맞지만 **GPT 캡션이 화면에 없는 내용을 지어내는 경우가 있다.**
+  예: 영상 1의 "컵라면을 열고 재료를 꺼내는 모습"은 화면에 컵라면이 없다. 이전 실행에서도 영상 3에서 "호숫가 캠프파이어" 같은 환각이 있었다.
+  영상 4는 인물 이름 없이 "여성/남성"으로만 서술한다. 프레임 수를 늘리고 detail=high로 바꿔도 환각이 없어지지는 않았다.
+
+### 3-4. 단순화(모션 점수 제거, 고정 길이 윈도우)가 결과에 준 영향
+기존 구조(화면 변화 점수 0.2 포함, 변화점 분할 조각)에서 단순 구조로 바꾼 뒤 같은 4개 영상을 다시 돌려 선택된 초의 겹침(Jaccard)을 비교했다.
+
+| 영상 | 하이라이트 겹침 | 요약에서 고른 구간 겹침 |
+|---|---|---|
+| 1 | 0.89 | 0.60 |
+| 2 | 0.41 | 0.61 |
+| 3 | 0.88 | 0.57 |
+| 4 | 0.27 | 0.61 |
+
+- 하이라이트는 영상 1·3에서 거의 같고, 영상 2·4는 일부 구간이 바뀌었다(영상 4는 앞 클립이 167초 → 128초 부근으로 이동).
+- 요약은 윈도우 구조가 달라 구간 자체가 달라진다. 겹침은 0.6 안팎이다.
+- 겹침이 높다고 품질이 같다는 뜻은 아니다. **어느 쪽이 더 좋은지는 정답이 없어 측정하지 못했다.**
+
+### 3-5. 검증하지 못한 것 (주의)
+- **하이라이트·요약·시나리오의 최종 품질을 정답과 비교한 정량 평가는 없다.** 3-1은 UniVTG 부분만의 수치이고, 4개 영상은 눈으로 본 사례다.
+- **오디오를 합쳐서 성능이 오르는지는 측정하지 않았다.** TVSum 평가에는 오디오가 없어 오디오 항이 꺼져 있다.
+- 가중치 0.7/0.3, 소리 종류별 가중치, 윈도우 표(12/20/30초, 경계 6분·20분), 10 % 예산, MMR의 0.7/0.3, "윈도우 안 상위 절반 평균"은 **모두 정해 둔 값이고 최적화하거나 비교 검증하지 않았다.**
+- 윈도우 안에 장면이 둘 이상 섞일 수 있다(고정 길이 분할의 한계). 변화점 분할과의 품질 비교는 하지 않았다.
+- 영상 약 11분(324클립)까지만 UniVTG 입력 경로를 검증했다. 더 긴 영상은 같은 크기로 나눠 점수를 내며, 이 경로는 검증하지 않았고 경고가 출력된다.
+- 하이라이트 총 길이 상한(60초)은 긴 영상에는 짧을 수 있다.
+- 텍스트 쿼리(제목)가 부정확하면 saliency가 흔들린다. 제목이 의미 없는 파일명이면 Qwen 설명을 쓰는 편이 낫다.
+- 실제로 돌려 본 영상은 길이 약 100~300초인 4개뿐이다.
+
+## 4. UniVTG 원본과의 대응
+- **saliency**: 영상 토큰(Adapter 통과)과 pooling한 텍스트 쿼리의 코사인 유사도(`univtg/model.py`). 하이라이트 점수 S와 요약 중요도에 쓴다.
+- **오디오**는 UniVTG에 없는 입력이다. 모델을 건드리지 않고 late fusion으로 합친다(이 프로젝트의 확장).
+- 원본의 평가는 클립 점수를 정렬해 상위 클립을 고르는 방식이다. **구간 확장, 윈도우 분할, MMR, GPT 캡션·시나리오는 이 프로젝트에서 추가한 부분이다.**
+- Adapter 학습은 `scripts/univtg/train_adapter.py`.

@@ -32,14 +32,13 @@ def representativeness(vision: np.ndarray) -> np.ndarray:
 
 
 def importance_curve(av, events: np.ndarray, classes, cfg, saliency: np.ndarray = None):
-    """-> (importance (T,) in [0,1], parts). Components are rank-normalised, smoothed and mixed with cfg weights.
-    saliency = the head's per-second score (s + f; only its ranks matter); None uses representativeness; a video without audio drops the audio term and renormalises the weights."""
+    """-> (importance (T,) in [0,1], parts). Components are rank-normalised, smoothed and mixed with cfg weights (summing to 1).
+    saliency = the head's per-second score (s + f; only its ranks matter); None uses representativeness; a video without audio uses the saliency alone."""
     sal_src = "head:s+f" if saliency is not None else "representativeness"
     sal = saliency if saliency is not None else representativeness(av.vision)
-    w = np.array([cfg.w_saliency, cfg.w_audio if av.has_audio else 0.0, cfg.w_motion])
+    w = (cfg.w_saliency, cfg.w_audio) if av.has_audio else (1.0, 0.0)   # no audio track: saliency alone
     ev_w = np.array([cfg.event_weights.get(c, 0.0) for c in classes])
     parts = {"saliency": rank_norm(smooth(sal, cfg.smooth_sec)),
-             "audio": rank_norm(smooth(events @ ev_w, cfg.smooth_sec)),
-             "motion": rank_norm(smooth(visual_change(av.vision), cfg.smooth_sec))}
-    imp = (w[0] * parts["saliency"] + w[1] * parts["audio"] + w[2] * parts["motion"]) / w.sum()
+             "audio": rank_norm(smooth(events @ ev_w, cfg.smooth_sec))}
+    imp = w[0] * parts["saliency"] + w[1] * parts["audio"]
     return imp, {**parts, "saliency_source": sal_src}
