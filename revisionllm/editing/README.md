@@ -80,14 +80,15 @@ UniVTG는 시각 정보만 쓰므로, **CLAP 오디오 점수를 늦게 합치�
 | `summarize.py` | 고정 윈도우 분할 + MMR 대표 구간 선택 |
 | `scenario_llm.py` | 구간 캡션(이미지) → 시나리오 JSON, 검증·정렬 |
 | `query_gen.py`, `qwen_describe.py` | 제목이 없을 때 로컬 Qwen이 만드는 텍스트 쿼리(영상당 1회, DB 캐시) |
-| `scripts/highlights/run_all.py`, `run_recommend.py` | 저장소 루트의 영상 전체에 하이라이트 / 시나리오 추천을 돌리는 추론 스크립트 |
+| `scripts/highlight/run_highlight.py`, `scripts/summary/run_summary.py`, `scripts/scenario/run_scenario.py` | 저장소 루트의 영상 전체에 하이라이트 / 영상 요약(LLM 없음) / 시나리오 추천(GPT)을 기능별로 돌리는 추론 스크립트 |
 | `db.py`, `service.py`, `cli.py` | `edit_result` 테이블 캐시, 오케스트레이션, CLI |
 | `config.py` | 모든 설정(`EditConfig`): 가중치, 윈도우 표, 예산, 프레임 설정 등 |
 
 ### 2-5. 사용법
 ```bash
 export OPENAI_API_KEY=...  CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
-python revisionllm/editing/cli.py recommend --video X.mp4 --goal "1분 요약" --title "제주 여행 브이로그"
+python revisionllm/editing/cli.py summary   --video X.mp4 --title "제주 여행 브이로그"                    # 대표 구간 (LLM 없음)
+python revisionllm/editing/cli.py scenario  --video X.mp4 --goal "1분 요약" --title "제주 여행 브이로그"   # 요약 → 캡션 → 시나리오 (GPT). 옛 이름 recommend도 동작
 python revisionllm/editing/cli.py highlight --video X.mp4 --out X_hl.mp4 --title "제주 여행 브이로그"   # 제목이 없으면 Qwen이 설명 생성
 ```
 결과 캐시 키에는 설정·feature 버전·스코어러 버전이 들어가므로, 설정을 바꾸면 자동으로 다시 계산된다.

@@ -1,7 +1,8 @@
 """One uploaded video, several editing requests, one feature extraction.
 
   export OPENAI_API_KEY=...   CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
-  python revisionllm/editing/cli.py recommend --video X.mp4 [--goal "1분짜리 여행 브이로그"]
+  python revisionllm/editing/cli.py summary   --video X.mp4 [--title "..."]                # representative segments, no LLM
+  python revisionllm/editing/cli.py scenario  --video X.mp4 [--goal "1분짜리 여행 브이로그"]   # summary -> captions -> scenario (GPT)
   python revisionllm/editing/cli.py highlight --video X.mp4 --out X_highlight.mp4 [--seconds 30] [--title "..."]
   python revisionllm/editing/cli.py ground    --video X.mp4 --query "a person laughs"     # loads the 7B model
   python revisionllm/editing/cli.py all       --video X.mp4 --query "a person laughs" --out X_highlight.mp4
@@ -22,7 +23,7 @@ from revisionllm.multiquery.service import mmss
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["ground", "recommend", "highlight", "all"])
+    ap.add_argument("cmd", choices=["ground", "summary", "scenario", "recommend", "highlight", "all"])
     add_model_args(ap)
     ap.add_argument("--video", required=True)
     ap.add_argument("--query", action="append", default=[])
@@ -61,7 +62,11 @@ def main():
         print("== Scenario Grounding ==")
         for r in svc.ground(a.video, a.query):
             print(f"{r.query!r}: {mmss(r.start_time)} ~ {mmss(r.end_time)}  [{r.source}]")
-    if a.cmd in ("recommend", "all"):
+    if a.cmd == "summary":
+        print("== Video Summary ==")
+        for sg in svc.summary(a.video, a.title):
+            print(f"{mmss(sg.start)} ~ {mmss(sg.end)}  importance={sg.importance:.2f}  tags={sg.tags}")
+    if a.cmd in ("scenario", "recommend", "all"):         # recommend: the old name of scenario
         print("== Scenario Recommendation ==")
         print(json.dumps(svc.recommend(a.video, a.goal, a.seconds, a.title), ensure_ascii=False, indent=1))
     if a.cmd in ("highlight", "all"):

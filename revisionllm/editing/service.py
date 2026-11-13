@@ -134,7 +134,7 @@ class EditingService:
             raise RuntimeError("grounding needs the ReVisionLLM checkpoint: build the service with grounder=MultiQueryGrounder")
         return self.grounder.run(video_path, queries)
 
-    # ---- 2. Scenario Recommendation -------------------------------------------------------------------------
+    # ---- 2a. Video Summary (no LLM) / 2b. Scenario Recommendation (GPT) -------------------------------------------------------------------------
     def summary(self, video_path: str, title: Optional[str] = None) -> List[Segment]:
         av = self.representation(video_path)
         qtext, qvec = self.video_query(video_path, title)
@@ -147,10 +147,9 @@ class EditingService:
         self.db.put_result(av.video_id, "summary", key, [s.to_dict() for s in segs])
         return segs
 
-    def recommend(self, video_path: str, goal: Optional[str] = None, target_sec: Optional[float] = None,
-                  title: Optional[str] = None) -> dict:
+    def scenario(self, video_path: str, segs: List[Segment], goal: Optional[str] = None, target_sec: Optional[float] = None) -> dict:
+        """Captions of the given summary segments (GPT, one per segment) -> editing scenario (GPT). The summary itself is made by summary()."""
         av = self.representation(video_path)
-        segs = self.summary(video_path, title)
         for s in segs:                                    # captions are per segment, so a changed goal does not redo them
             ck = params_key(av.feature_version, "caption", s.start, s.end, s.key_times, self.cfg.openai_model, self.cfg.language,
                             self.cfg.frame_max_side, self.cfg.frame_detail)
@@ -167,6 +166,11 @@ class EditingService:
             out["segments"] = [s.to_dict() for s in segs]
             self.db.put_result(av.video_id, "scenario", sk, out)
         return out
+
+    def recommend(self, video_path: str, goal: Optional[str] = None, target_sec: Optional[float] = None,
+                  title: Optional[str] = None) -> dict:
+        """summary() followed by scenario()."""
+        return self.scenario(video_path, self.summary(video_path, title), goal, target_sec)
 
     # ---- 3. Highlight Extraction ----------------------------------------------------------------------------
     def highlight(self, video_path: str, out_path: Optional[str] = None, target_sec: Optional[float] = None,

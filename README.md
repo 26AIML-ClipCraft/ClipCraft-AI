@@ -74,7 +74,9 @@ revisionllm/
   multiquery/       B. Multi-Query + Feature / Semantic Query Cache
   editing/          C. 하이라이트 · 요약 · 시나리오 추천, UniVTG 스코어러
   data/             feature 추출기 (CLIP, CLAP)
-scripts/highlights/ 저장소 루트의 영상 전체에 하이라이트 / 시나리오 추천을 돌리는 스크립트
+scripts/highlight/  하이라이트 실행 (run_highlight.py)
+scripts/summary/    영상 요약 실행, LLM 없음 (run_summary.py)
+scripts/scenario/   시나리오 추천 실행, GPT 사용 (run_scenario.py)
 docs/diagrams/      파이프라인 도면 (svg, png, draw.io)
 tests/              test_multiquery_cache / test_editing / test_univtg_scorer
 ```
@@ -110,11 +112,12 @@ python revisionllm/multiquery/cli.py --video X.mp4 --query "the person closes th
 **C. 하이라이트 / 시나리오 추천**
 ```bash
 export OPENAI_API_KEY=...  CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
-python revisionllm/editing/cli.py recommend --video X.mp4 --goal "1분 요약" --title "영상 제목"
+python revisionllm/editing/cli.py summary   --video X.mp4 --title "영상 제목"                    # 대표 구간 (LLM 없음)
+python revisionllm/editing/cli.py scenario  --video X.mp4 --goal "1분 요약" --title "영상 제목"   # 요약 → 캡션 → 시나리오 (GPT)
 python revisionllm/editing/cli.py highlight --video X.mp4 --out X_highlight.mp4 --title "영상 제목"
 ```
 
-루트의 영상 전체에 한꺼번에 돌릴 때: `python scripts/highlights/run_all.py`, `python scripts/highlights/run_recommend.py` (결과는 `results/highlights/`에 쓴다).
+루트의 영상 전체에 한꺼번에 돌릴 때: `python scripts/highlight/run_highlight.py`, `python scripts/summary/run_summary.py`, `python scripts/scenario/run_scenario.py` (결과는 `results/highlight|summary|scenario/`에 쓴다). 시나리오는 요약 결과를 이어받아 쓰며, 요약이 캐시에 없으면 먼저 계산한다.
 
 **테스트**
 ```bash
