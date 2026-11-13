@@ -29,23 +29,18 @@ def main():
     ap.add_argument("--goal", help="optional editing intent given to the LLM")
     ap.add_argument("--seconds", type=float, help="target length of the scenario / highlight")
     ap.add_argument("--out", help="highlight video path (omit to only print the plan)")
-    ap.add_argument("--head", default=EditConfig.head_ckpt, help="trained head checkpoint; missing -> training-free saliency")
-    ap.add_argument("--scorer", choices=["head", "univtg"], default=None,
-                    help="univtg (default, or $CLIPCRAFT_SCORER): released UniVTG on the cached CLIP-L/14 features through the aligned "
-                         "Adapter (checkpoints/univtg/); needs a title or the Qwen description as its text query. "
-                         "head: the AV head trained in this repository (checkpoints/editing_head/)")
     ap.add_argument("--model", help="OpenAI model (default $CLIPCRAFT_OPENAI_MODEL or gpt-4o-mini)")
     ap.add_argument("--query_batch", type=int, default=8)
-    ap.add_argument("--title", help="video title: the text query of the head. Without it a local Qwen VLM describes the video")
+    ap.add_argument("--title", help="video title: the text query of UniVTG. Without it a local Qwen VLM describes the video")
     ap.add_argument("--vlm_model", default="Qwen/Qwen3-VL-8B-Instruct")
     ap.add_argument("--vlm_python", help="python of an env with transformers >= 4.57 for Qwen3-VL (default $CLIPCRAFT_VLM_PYTHON)")
     a = ap.parse_args()
 
-    cache_cfg, cfg = make_cfg(a), EditConfig(head_ckpt=a.head)
+    cache_cfg, cfg = make_cfg(a), EditConfig()
     if a.model:
         cfg.openai_model = a.model
     from revisionllm.editing.scorers import make_scorer
-    scorer = make_scorer(a.scorer, a.head)
+    scorer = make_scorer()
     print(f"[editing] scorer: {type(scorer).__name__}")
 
     from revisionllm.editing.db import EditDB

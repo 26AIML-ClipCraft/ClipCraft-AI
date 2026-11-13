@@ -80,6 +80,7 @@ UniVTG는 시각 정보만 쓰므로, **CLAP 오디오 점수를 늦게 합치�
 | `summarize.py` | 고정 윈도우 분할 + MMR 대표 구간 선택 |
 | `scenario_llm.py` | 구간 캡션(이미지) → 시나리오 JSON, 검증·정렬 |
 | `query_gen.py`, `qwen_describe.py` | 제목이 없을 때 로컬 Qwen이 만드는 텍스트 쿼리(영상당 1회, DB 캐시) |
+| `scripts/highlights/run_all.py`, `run_recommend.py` | 저장소 루트의 영상 전체에 하이라이트 / 시나리오 추천을 돌리는 추론 스크립트 |
 | `db.py`, `service.py`, `cli.py` | `edit_result` 테이블 캐시, 오케스트레이션, CLI |
 | `config.py` | 모든 설정(`EditConfig`): 가중치, 윈도우 표, 예산, 프레임 설정 등 |
 
@@ -115,7 +116,7 @@ LLM 캐시는 모델·언어·프롬프트·프레임 설정까지 키에 포함
   하이라이트가 예산을 지키고 오디오 점수가 높은 구간을 고른다, 설정이 바뀌면 캐시 키가 바뀐다.
 
 ### 3-3. 실제 영상 4개 데모 (정성 + 수치)
-저장소 루트의 영상 4개(드라마·요리 영상 100~300초)에 전체 파이프라인을 돌렸다. 결과 화면은 `ClipCraft - Highlights.html`, 스크린샷은 `results/highlights/screenshots/`.
+저장소 루트의 영상 4개(드라마·요리 영상 100~300초)에 전체 파이프라인을 돌렸다. 결과 화면과 스크린샷은 `audio-fusion` 브랜치의 `results/highlights/`에 있다.
 
 | 영상 | 길이 | 하이라이트 | 합계(목표) | 요약 윈도우(W=12초) | 시나리오 장면 |
 |---|---|---|---|---|---|
@@ -163,4 +164,4 @@ LLM 캐시는 모델·언어·프롬프트·프레임 설정까지 키에 포함
 - **saliency**: 영상 토큰(Adapter 통과)과 pooling한 텍스트 쿼리의 코사인 유사도(`univtg/model.py`). 하이라이트 점수 S와 요약 중요도에 쓴다.
 - **오디오**는 UniVTG에 없는 입력이다. 모델을 건드리지 않고 late fusion으로 합친다(이 프로젝트의 확장).
 - 원본의 평가는 클립 점수를 정렬해 상위 클립을 고르는 방식이다. **구간 확장, 윈도우 분할, MMR, GPT 캡션·시나리오는 이 프로젝트에서 추가한 부분이다.**
-- Adapter 학습은 `scripts/univtg/train_adapter.py`.
+- Adapter 학습 스크립트와 실험용 코드는 `audio-fusion` 브랜치에만 있다. 이 브랜치에는 추론에 쓰는 코드만 둔다.

@@ -13,13 +13,11 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from revisionllm.editing.audio_events import EVENT_PROMPTS, AudioEventTagger
 from revisionllm.editing.config import EditConfig
-from revisionllm.editing.legacy.dataset import collate
 from revisionllm.editing.highlight import plan_highlight
 from revisionllm.editing.scenario_llm import ScenarioLLM, validate_scenario
 from revisionllm.editing.scoring import importance_curve
 from revisionllm.editing.shared import AVRepresentation, to_second_grid
 from revisionllm.editing.summarize import Segment, summarize
-from revisionllm.editing.legacy.univtg_head import AVUniVTG, HeadConfig, giou_1d, univtg_loss
 
 CLASSES = list(EVENT_PROMPTS)
 
@@ -51,50 +49,6 @@ def test_second_grid():
     assert not silent.any()
 
 
-def test_head_forward_loss_and_backward():
-    m = AVUniVTG(HeadConfig(d_model=32, heads=2, layers=1, ff=64))
-    B, T = 3, 20
-    vis, aud, q = torch.randn(B, T, 768), torch.randn(B, T, 512), torch.randn(B, 768)
-    mask = torch.ones(B, T, dtype=torch.bool); mask[2, 15:] = False
-    out = m(vis, aud, q, mask)
-    assert out["saliency"].shape == (B, T) and out["offsets"].shape == (B, T, 2) and (out["offsets"] >= 0).all()
-    assert m(vis, aud, None, mask)["foreground"].shape == (B, T)                          # query-free path
-    fg = torch.zeros(B, T); fg[:, 5:10] = 1
-    off = torch.stack([(torch.arange(T) - 5.0).clamp(min=0).expand(B, T), (10.0 - torch.arange(T)).clamp(min=0).expand(B, T)], -1)
-    tgt = {"mask": mask, "has_query": torch.tensor([True, True, False]), "foreground": fg, "offsets": off,
-           "sal_pos": torch.full((B, 2), 7), "sal_neg": torch.full((B, 2), 1), "sal_valid": torch.ones(B, 2, dtype=torch.bool)}
-    loss, parts = univtg_loss(out, tgt)
-    loss.backward()
-    assert torch.isfinite(loss) and set(parts) == {"fg", "l1", "giou", "sal"} and parts["fg"] > 0 and parts["sal"] > 0
-    # ranking loss is 0 once the positive clip outranks the negative by the margin, and ignores invalid pairs
-    good = {**out, "saliency": torch.zeros(B, T)}
-    good["saliency"][:, 7], good["saliency"][:, 1] = 5.0, -5.0
-    assert univtg_loss(good, tgt)[1]["sal"] == 0.0
-    assert univtg_loss(out, {**tgt, "sal_valid": torch.zeros(B, 2, dtype=torch.bool)})[1]["sal"] == 0.0
-    assert m.null_query.grad is None or m.null_query.grad.abs().sum() >= 0
-    assert abs(float(giou_1d(*(torch.tensor([x]) for x in (2., 3., 2., 3.))))) == pytest.approx(1.0)
-
-
-def test_padding_does_not_change_outputs():
-    m = AVUniVTG(HeadConfig(d_model=32, heads=2, layers=1, ff=64)).eval()
-    vis, aud = torch.randn(1, 12, 768), torch.randn(1, 12, 512)
-    a = m(vis, aud, None)["saliency"]
-    vp, ap = torch.cat([vis, torch.zeros(1, 5, 768)], 1), torch.cat([aud, torch.zeros(1, 5, 512)], 1)
-    mask = torch.arange(17)[None] < 12
-    b = m(vp, ap, None, mask)["saliency"][:, :12]
-    # positions are the same and the padded tail is masked out of attention
-    assert torch.allclose(a, b, atol=1e-4)
-
-
-def test_collate_pads():
-    mk = lambda L: {"vision": torch.zeros(L, 768), "audio": torch.zeros(L, 512), "foreground": torch.zeros(L),
-                    "offsets": torch.zeros(L, 2), "query": torch.zeros(768), "has_query": True,
-                    "sal_pos": torch.zeros(2, dtype=torch.long), "sal_neg": torch.ones(2, dtype=torch.long),
-                    "sal_valid": torch.ones(2, dtype=torch.bool)}
-    b = collate([mk(5), mk(8)])
-    assert b["vision"].shape == (2, 8, 768) and b["mask"].sum(1).tolist() == [5, 8] and b["sal_pos"].shape == (2, 2)
-
-
 def test_service_scores_follow_the_reference(tmp_path):
     """highlight = rank(s + f) mixed with audio events; summary = rank(f) only (UniVTG inference_hl / inference_qfvs)."""
     from revisionllm.editing.service import EditingService
@@ -123,39 +77,6 @@ def test_qwen_query_subprocess(tmp_path, monkeypatch):
     assert q.frame_times(100.0) == sorted(q.frame_times(100.0)) and len(q.frame_times(100.0)) == 4
     with pytest.raises(RuntimeError, match="boom"):
         query_gen.QwenQuery(python=str(bad))("v.mp4", 100.0)
-
-
-def test_dataset_video_level_query(tmp_path):
-    import hashlib
-    from revisionllm.data.audio_pipeline.lmdb_utils import LmdbWriter
-    from revisionllm.editing.legacy.dataset import ChapterAVDataset, joined_query
-    rng = np.random.default_rng(0)
-    cw, aw = LmdbWriter(str(tmp_path / "clip"), 1 << 28), LmdbWriter(str(tmp_path / "clap"), 1 << 28)
-    cw.put("v0", rng.normal(size=(400, 768))); aw.put("v0", rng.normal(size=(200, 512))); cw.close(); aw.close()
-    titles = ["Intro", "Demo", "Outro"]
-    (tmp_path / "a.jsonl").write_text(json.dumps({"vid": "v0", "duration": 200, "query": titles,
-                                                   "relevant_windows": [[[0, 60]], [[60, 140]], [[140, 200]]]}))
-
-    def emb(ts):                                          # deterministic vector per text, so a query can be traced to its text
-        out = [np.random.default_rng(int(hashlib.md5(t.encode()).hexdigest()[:8], 16)).normal(size=768) for t in ts]
-        return np.array([o / np.linalg.norm(o) for o in out], dtype=np.float32)
-
-    ds = ChapterAVDataset(str(tmp_path / "a.jsonl"), str(tmp_path / "clip"), str(tmp_path / "clap"), emb, crop=64,
-                          query_prob=0.5, samples_per_video=40, seed=1, fixed=True)
-    joined = emb([joined_query(titles)])[0]
-    chapter = emb(titles)
-    assert joined_query(titles) == "Intro, Demo, Outro"
-    n_video = 0
-    for i in range(len(ds)):
-        x = ds[i]
-        q = x["query"].numpy()
-        if x["has_query"]:
-            assert any(np.allclose(q, c) for c in chapter)
-        else:
-            n_video += 1
-            assert np.allclose(q, joined)
-            assert 0 < x["foreground"].sum() < len(x["foreground"])                     # top-30% match, not everything
-    assert 5 < n_video < 35
 
 
 def test_summarize_finds_the_scenes():

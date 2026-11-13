@@ -7,7 +7,6 @@ from typing import Dict, Optional
 class EditConfig:
     """Settings of the editing features (scenario recommendation, highlight extraction). Everything that changes a stored
     result is folded into the result key (see service.params_key), so a changed setting never reuses an old result."""
-    head_ckpt: Optional[str] = "checkpoints/editing_head/head.pt"   # None / missing file -> training-free fallback saliency
     openai_model: str = field(default_factory=lambda: os.environ.get("CLIPCRAFT_OPENAI_MODEL", "gpt-4o-mini"))
     language: str = "ko"                      # language of captions / scenario text written by the LLM
 
