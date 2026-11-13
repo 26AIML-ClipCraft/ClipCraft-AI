@@ -1,6 +1,6 @@
 # ClipCraft-AI
 
-**영상 검색·편집을 위한 AI 추론 모듈.** 공개 [ReVisionLLM](https://arxiv.org/pdf/2411.14901)(영상에서 문장이 일어나는 시간 구간을 찾는 LLM)을 기반으로 한다.
+**영상 검색·편집을 위한 AI 추론 모듈.** 공개 [ReVisionLLM](https://arxiv.org/pdf/2411.14901)(영상에서 문장이 일어나는 시간 구간을 찾는 LLM)을 기반으로 하고, 하이라이트·영상 요약의 중요도 점수에는 [UniVTG](https://github.com/showlab/UniVTG)(영상 하이라이트·구간 검색 모델)를 사용한다. UniVTG는 저장소를 포크하지 않고, 추론에 필요한 모델 코드(`revisionllm/editing/univtg/`, MIT 라이선스 파일 포함)와 공개 가중치만 가져와 쓴다.
 
 이 브랜치(`main`)에는 **추론 코드만** 있다. 학습 스크립트, 실험·평가 코드, 학습된 체크포인트와 로그, 결과물은 `audio-fusion` 브랜치에 있다.
 
