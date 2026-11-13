@@ -1,149 +1,137 @@
-# ReVisionLLM
-[ReVisionLLM: Recursive Vision-Language Model for Temporal Grounding in Hour-Long Videos](https://arxiv.org/pdf/2411.14901) 
+# ClipCraft-AI
 
-Tanveer Hannan Md Mohaiminul Islam  Jindong Gu Thomas Seidl Gedas Bertasius
+**영상 검색·편집을 위한 AI 추론 모듈.** 공개 [ReVisionLLM](https://arxiv.org/pdf/2411.14901)(영상에서 문장이 일어나는 시간 구간을 찾는 LLM)을 기반으로 한다.
 
-Accepted by **CVPR 2025**
+이 브랜치(`main`)에는 **추론 코드만** 있다. 학습 스크립트, 실험·평가 코드, 학습된 체크포인트와 로그, 결과물은 `audio-fusion` 브랜치에 있다.
 
-[[Website](https://sites.google.com/view/revisionllm)] [[Paper](https://arxiv.org/pdf/2411.14901)]
+| | 기능 | 한 줄 설명 | 코드 |
+| --- | --- | --- | --- |
+| A | **오디오-비주얼 Grounding** | 영상 프레임에 CLAP 오디오 feature를 더해, 소리 단서가 있는 문장("웃는다", "문을 닫는다")의 시간 구간을 찾는다 | `revisionllm/model/`, `revisionllm/inference.py` |
+| B | **Multi-Query + Feature / Semantic Query Cache** | 영상 feature는 한 번만 추출해 공유하고, 한 영상의 여러 질문을 한 배치로 처리하고, 비슷한 질문은 이전 결과를 재사용한다 | `revisionllm/multiquery/` |
+| C | **하이라이트 추출 + 영상 요약 → 시나리오 추천** | UniVTG로 영상 중요도를 초 단위로 계산해 하이라이트 영상을 만들고, 대표 장면 8곳으로 편집 시나리오를 추천한다 | `revisionllm/editing/` |
 
-[//]: # (Official PyTorch implementation of the paper "RGNet: A Unified Clip Retrieval and Grounding Network for Long Videos".)
+세 기능은 **한 번 추출해 캐시한 CLIP(영상) + CLAP(오디오) feature를 함께 쓴다.** 영상 인코딩은 파일당 한 번이다.
 
-
----
-
-## :loudspeaker: Latest Updates
-- **Mar-03**: The trained models weights are available [here](https://drive.google.com/drive/folders/19wqQ5QWijClP8XaWd031eAK6hGQA_7mX?usp=share_link) 
-- **Mar-03**: Released the training and evaluation code.
-- **Feb-27**: ReVisionLLM is accepted to CVPR 2025! :fire::fire:
----
-
-## ReVisionLLM Overview :bulb:
-
-ReVisionLLM is a recursive vision-language model designed to locate events in hour-long videos. Inspired by human search strategies, our model initially targets broad segments of interest, progressively revising its focus to pinpoint exact temporal boundaries. Our model can seamlessly handle videos of vastly different lengths, from minutes to hours. We also introduce a hierarchical training strategy that starts with short clips to capture distinct events and progressively extends to longer videos. ReVisionLLM is the first VLM capable of temporal grounding in hour-long videos.
-
-[//]: # (![framework]&#40;images/main.png&#41;)
-<img src="method.png" alt="drawing" width="1000"/>
+```mermaid
+flowchart LR
+  V["영상"] --> FC["Feature Cache (영상당 1회)<br/>CLIP ViT-L/14 @2fps · CLAP @1초"]
+  FC --> A["A. 오디오-비주얼 Grounding<br/>(ReVisionLLM + 오디오 branch)"]
+  A --> B["B. Multi-Query + Query Cache<br/>여러 질문 → 시간 구간"]
+  FC --> C1["C. 하이라이트 추출<br/>UniVTG saliency + 오디오 이벤트"]
+  FC --> C2["C. 영상 요약 → 시나리오 추천<br/>UniVTG saliency + MMR + GPT"]
+```
 
 ---
 
-## Contributions :trophy:
+## A. 오디오-비주얼 Grounding
 
-- We extend the existing VLMs to enable temporal grounding capabilities in hour-long videos.
-- We propose a vision-language model that recursively processes hour-long videos for effective and efficient hourlong video processing.
-- We propose a progressive training strategy, where the model is first trained to identify events in short video segments, then progressively scales to hour-long videos, enabling it to effectively handle longer, more complex video
-sequences.
-- Our model significantly outperforms previous state-ofthe-art approaches, surpassing specialized models and
-other Vision-Language Models (VLMs) on multiple datasets by a substantial margin. 
+ReVisionLLM이 보는 CLIP 프레임 feature에 오디오 항을 **어댑터에 들어가기 전에 더한다.** 텐서 모양이 바뀌지 않아 LLM 쪽은 그대로이다.
+
+```
+ṽ_t = v_t + α · LayerNorm( W₂ · GELU( W₁ · a_t ) )     v_t: CLIP 프레임(768), a_t: 그 시각의 CLAP 1초 벡터(512)
+```
+
+- 오디오 인코더 CLAP(`laion/clap-htsat-fused`)은 1초 창·1초 hop으로 feature를 뽑는다. 코드는 `revisionllm/model/adapter/audio_fusion.py`.
+- 오디오 branch는 학습된 체크포인트가 필요하다(이 브랜치에는 포함되어 있지 않다).
+
+<img src="method.png" alt="ReVisionLLM" width="900"/>
+
+## B. Multi-Query + Feature / Semantic Query Cache
+
+```
+Video ─ SHA-256 ─ video 테이블 조회
+          ├ 히트: vision.npy / audio.npy 로드
+          └ 미스: CLIP + CLAP 추출 → 저장                      (영상당 1회)
+각 Query ─ CLIP 텍스트 임베딩 ─ 같은 영상의 query_cache를 pgvector 코사인으로 검색
+          ├ 유사도 > 0.95: 저장된 구간 반환
+          └ 그 외: Grounding(여러 쿼리를 한 배치로) → 구간 반환 + 저장
+```
+
+- `feature_version` 또는 `model_version`이 바뀌면 feature와 결과 캐시를 다시 계산한다. 다른 체크포인트의 결과는 재사용하지 않는다.
+- PostgreSQL + pgvector가 필요하다. 자세한 설계: [revisionllm/multiquery/README.md](revisionllm/multiquery/README.md).
+
+## C. 하이라이트 추출 + 영상 요약 → 시나리오 추천
+
+캐시된 CLIP ViT-L/14 feature를 **Linear Adapter(768→512)** 로 UniVTG(CLIP-B/32용 공개 모델, 동결)의 feature 공간에 맞춰 영상 제목과의 유사도(saliency)를 초 단위로 구한다.
+
+| 하이라이트 | 영상 요약 → 시나리오 |
+| --- | --- |
+| <img src="docs/diagrams/highlight_pipeline.png" width="380"/> | <img src="docs/diagrams/summary_pipeline.png" width="380"/> |
+
+- **하이라이트**: `0.7 × UniVTG saliency + 0.3 × 오디오 이벤트(CLAP: 웃음·박수·음악·말 등)` 점수가 높은 지점에서 클립을 키워 영상 길이의 약 10 %(15~60초)를 이어 붙인다.
+- **요약 → 시나리오**: 영상을 고정 길이 윈도우(영상 6분 미만 12초 · 20분 미만 20초 · 그 이상 30초)로 자르고, 중요도와 다양성(MMR)으로 8곳을 골라
+  키프레임을 GPT(gpt-4o-mini)에 보내 캡션을 만든 뒤, 시간순으로 정리된 시나리오(제목·요약·장면별 설명·추천 이유)를 받는다.
+- 점수 계산, 파일 구성, 검증 범위와 한계: [revisionllm/editing/README.md](revisionllm/editing/README.md).
 
 ---
 
-## Installation :wrench:
-We recommend setting up a conda environment for the project:
-```shell
-conda create --name=revisionllm python=3.10
-conda activate revisionllm
+## 저장소 구조
 
-git clone https://github.com/Tanveer81/ReVisionLLM.git
-cd ReVisionLLM
-conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.6 -c pytorch -c nvidia
+```
+revisionllm/
+  model/            모델 (ReVisionLLM + 오디오 branch)
+  inference.py      grounding 추론
+  multiquery/       B. Multi-Query + Feature / Semantic Query Cache
+  editing/          C. 하이라이트 · 요약 · 시나리오 추천, UniVTG 스코어러
+  data/             feature 추출기 (CLIP, CLAP)
+scripts/highlights/ 저장소 루트의 영상 전체에 하이라이트 / 시나리오 추천을 돌리는 스크립트
+docs/diagrams/      파이프라인 도면 (svg, png, draw.io)
+tests/              test_multiquery_cache / test_editing / test_univtg_scorer
+```
+
+## 설치
+
+Python 3.10, PyTorch 2.4.1(cu121).
+
+```bash
+conda create -n revaudio python=3.10 -y && conda activate revaudio
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
-Additionally, install additional packages for training cases.
-```shell
-pip install ninja
-pip install flash-attn==2.5.6 --no-build-isolation
+
+## 필요한 외부 자원 (저장소에 포함되어 있지 않음)
+
+| 자원 | 위치 | 용도 |
+| --- | --- | --- |
+| CLIP ViT-L/14, Vicuna-7B v1.5, Stage-1/2 가중치 | `checkpoints/` ([VTimeLLM](https://github.com/huangb23/VTimeLLM/blob/main/docs/train.md) 안내) | A, B |
+| 오디오 branch를 학습한 체크포인트 | `checkpoints/audio_charades_long/stageB_R2_seed0` | A, B |
+| UniVTG(`univtg_ft_b32.pt`)와 Adapter(`adapter_align.pt`) | `checkpoints/univtg/` | C |
+| PostgreSQL + pgvector | `CLIPCRAFT_DB_DSN` | B, C |
+| OpenAI API 키 | `OPENAI_API_KEY` | C (캡션·시나리오) |
+
+## 실행
+
+**B. 여러 질문으로 grounding**
+```bash
+export CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
+python revisionllm/multiquery/cli.py --video X.mp4 --query "the person closes the door." --query "a person is sneezing"
 ```
 
-## Process MAD Dataset:
-- Follow [RGNet](https://github.com/Tanveer81/RGNet) to download and extracted features for the MAD Dataset and put them in /data/mad/ folder.
-- Run the following commands to extract more features
-```shell
-python revisionllm/data/mad/mad_to_activitynet.py
-python revisionllm/data/feature_extraction/mad_clip_text_extractor.py
-```
-## Process VidChapters-7M Dataset:
-- Follow [VidChapters-7M](https://github.com/antoyang/VidChapters) to download the VidChapters-7M Dataset and put that in /data/chapters/ folder.
-- Run the following commands to extract features
-```shell
-python revisionllm/data/feature_extraction/chapters_clip_text_extractor.py
-python revisionllm/data/vidchap7m/chapters_clip_extractor.py
-python revisionllm/data/vidchap7m/chapters_test_to_activitynet.py
-python revisionllm/data/vidchap7m/chapters_to_activitynet.py
+**C. 하이라이트 / 시나리오 추천**
+```bash
+export OPENAI_API_KEY=...  CLIPCRAFT_DB_DSN=postgresql://localhost:5432/clipcraft
+python revisionllm/editing/cli.py recommend --video X.mp4 --goal "1분 요약" --title "영상 제목"
+python revisionllm/editing/cli.py highlight --video X.mp4 --out X_highlight.mp4 --title "영상 제목"
 ```
 
-[//]: # (## Process MSRVTT Dataset:)
+루트의 영상 전체에 한꺼번에 돌릴 때: `python scripts/highlights/run_all.py`, `python scripts/highlights/run_recommend.py` (결과는 `results/highlights/`에 쓴다).
 
-[//]: # (- Follow [CLIP4Clip]&#40;https://github.com/ArrowLuo/CLIP4Clip&#41; to download the MSRVTT Dataset and put that in /data/chapters/ folder.)
-
-[//]: # (- Run the following commands to extract features)
-
-[//]: # (```shell)
-
-[//]: # (python revisionllm/data/retrieval/msrvtt/msrvtt_retrieval_to_activitynet.py)
-
-[//]: # (python revisionllm/data/retrieval/msrvtt/msrvtt_clip_extractor.py)
-
-[//]: # (python revisionllm/data/feature_extraction/msrvtt_clip_text_extractor.py)
-
-[//]: # (```)
-
-## Download Encoder And LLM Weights
-Follow [VTimeLLM](https://github.com/huangb23/VTimeLLM/blob/main/docs/train.md) to download CLIP, Vicuna-v1.5, Stage-1 and Stage-2 weights and place them in /checkpoints folder.
-
-## Training on MAD Dataset:
-```shell
-sh scripts/mad/stage1_dense.sh
-sh scripts/mad/stage1_sparse.sh
-sh scripts/mad/stage2_long_33.sh
-sh scripts/mad/stage2_long_100.sh
+**테스트**
+```bash
+python -m pytest tests
+CLIPCRAFT_TEST_DSN=postgresql://localhost:5433/clipcraft python -m pytest tests/test_multiquery_cache.py   # DB 필요
 ```
-
-## Inference on MAD Dataset:
-```shell
-bash scripts/mad/eval_stage1_dense.sh
-bash scripts/mad/eval_stage2_33.sh
-bash scripts/mad/eval_stage2_100.sh
-python revisionllm/eval/metric_retrieval_forward.py
-```
-
-## Training on VidChapters7M Dataset:
-```shell
-sh scripts/chapters/stage1_dense.sh
-sh scripts/chapters/stage1_sparse.sh
-sh scripts/chapters/stage2_long_100.sh
-```
-
-## Inference on VidChapters7M Dataset:
-```shell
-bash scripts/chapters/eval_loop_stage1_dense.sh
-bash scripts/chapters/eval_stage2_100.sh
-python revisionllm/eval/metric_retrieval_forward_chapters.py
-```
-
-## Qualitative Analysis :mag:
-
-A Comprehensive Evaluation of ReVisionLLM's Performance on MAD Datasets.
-
-[//]: # (![framework]&#40;images/main.png&#41;)
-<img src="qual.png" alt="drawing" width="1000"/>
 
 ---
 
+## Acknowledgements
 
-## Acknowledgements :pray:
+* [ReVisionLLM](https://github.com/Tanveer81/ReVisionLLM): 기반 모델 (Hannan et al., CVPR 2025)
+* [VTimeLLM](https://github.com/huangb23/VTimeLLM), [LLaVA](https://github.com/haotian-liu/LLaVA), [FastChat](https://github.com/lm-sys/FastChat), [Video-ChatGPT](https://github.com/mbzuai-oryx/Video-ChatGPT), [LLaMA](https://github.com/facebookresearch/llama)
+* [UniVTG](https://github.com/showlab/UniVTG): 하이라이트·요약의 중요도 점수 (MIT)
+* [CLAP](https://github.com/LAION-AI/CLAP): 오디오 feature, [CLIP](https://github.com/openai/CLIP): 영상·텍스트 feature
 
-We are grateful for the following awesome projects our ReVisionLLM arising from:
-
-* [LLaVA](https://github.com/haotian-liu/LLaVA): Large Language and Vision Assistant
-* [FastChat](https://github.com/lm-sys/FastChat): An Open Platform for Training, Serving, and Evaluating Large Language Model based Chatbots
-* [Video-ChatGPT](https://github.com/mbzuai-oryx/Video-ChatGPT): Towards Detailed Video Understanding via Large Vision and Language Models
-* [LLaMA](https://github.com/facebookresearch/llama): Open and Efficient Foundation Language Models
-* [VTimeLLM](https://github.com/huangb23/VTimeLLM): Video moment understanding and reasoning model.
-* [VidChapters7M](https://github.com/antoyang/VidChapters): A large-scale dataset of user-chaptered videos
-* [MAD](https://github.com/Soldelli/MAD): A Scalable Dataset for Language Grounding in Videos from Movie Audio Descriptions
-
-If you're using ReVisionLLM in your research or applications, please cite using this BibTeX:
+기반 모델을 사용한다면 아래를 인용해 주세요.
 ```bibtex
 @article{hannan2024revisionllm,
   title={ReVisionLLM: Recursive Vision-Language Model for Temporal Grounding in Hour-Long Videos},
@@ -153,11 +141,7 @@ If you're using ReVisionLLM in your research or applications, please cite using 
 }
 ```
 
-## License :scroll:
-<a rel="license" href="https://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-nd/4.0/80x15.png" /></a> 
+## License
+<a rel="license" href="https://creativecommons.org/licenses/by-nc-nd/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-nd/4.0/80x15.png" /></a>
 
 This work is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/">Creative Commons Attribution-NonCommercial-NoDerivs 4.0 International License</a>.
-
-
-Looking forward to your feedback, contributions, and stars! :star2:
-

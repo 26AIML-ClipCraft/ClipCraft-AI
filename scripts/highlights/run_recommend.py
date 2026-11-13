@@ -3,6 +3,7 @@ The OpenAI key is read from ~/.openai_key (never printed)."""
 import glob, json, os, re, sys, unicodedata
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 os.chdir(ROOT); sys.path.insert(0, ROOT)
+os.makedirs("results/highlights", exist_ok=True)
 key = os.path.expanduser("~/.openai_key")
 if "OPENAI_API_KEY" not in os.environ and os.path.exists(key):
     os.environ["OPENAI_API_KEY"] = open(key).read().strip()

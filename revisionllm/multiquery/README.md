@@ -12,7 +12,6 @@
 | `grounder.py` | R2를 한 번만 로드, 영상의 윈도우를 한 번만 만들어 모든 쿼리가 공유, 쿼리별 grounding |
 | `service.py` | 쿼리마다 CLIP 텍스트 임베딩 → 같은 `video_id` 안에서 코사인 검색 → 히트: 재사용 / 미스: grounding 후 저장 |
 | `cli.py` | `--video X.mp4 --query ... --query ...` |
-| `calibrate.py` | Charades-STA 테스트에서 threshold별 캐시 정확도 측정 |
 
 ## 사용법
 
@@ -30,7 +29,7 @@ python revisionllm/multiquery/cli.py --video data/charades/Charades_v1_480/AL1WC
 - **Threshold** (`CacheConfig.similarity_threshold`, `--threshold`, 기본 0.95, 엄밀히 초과일 때 히트). 임베딩은 모델이 쓰는
   CLIP 텍스트 EOT feature다. Charades-STA 테스트의 같은 영상 쿼리 쌍 5,527개에서 0.95로 히트한 경우 98.0%가 같은 장면
   (GT IoU ≥ 0.5)을 가리켰고 전체 쌍의 3.6%가 히트했다. 0.90은 90.7% / 11.4%. 임베딩이나 데이터 도메인이 바뀌면
-  `calibrate.py`를 다시 돌릴 것.
+  threshold를 다시 검증할 것(검증 스크립트는 `audio-fusion` 브랜치).
 - **쿼리 배치.** forward 한 번의 행은 (쿼리, 윈도우) 쌍이며 모든 쿼리가 같은 윈도우 텐서를 공유한다. 행마다 프롬프트와
   쿼리 feature가 다르고, 길이가 다른 프롬프트는 **left padding**한다(`inference()`가 프롬프트 리스트를 받음, 기존 단일
   프롬프트 호출은 그대로). 패딩을 지원하려고 모델 코드 두 곳을 고쳤다.

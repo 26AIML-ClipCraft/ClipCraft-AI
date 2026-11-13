@@ -2,6 +2,7 @@
 import glob, json, os, re, subprocess, sys, unicodedata
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 os.chdir(ROOT); sys.path.insert(0, ROOT)
+os.makedirs("results/highlights", exist_ok=True)
 from revisionllm.editing.config import EditConfig
 from revisionllm.editing.service import EditingService
 from revisionllm.editing.scorers import make_scorer

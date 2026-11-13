@@ -1,42 +1,0 @@
-You are using a model of type llama to instantiate a model of type VTimeLLM. This is not supported for all configurations of models and can yield errors.
-Loading VTimeLLM from base model...
-Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:21<00:21, 21.87s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:29<00:00, 13.43s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:29<00:00, 14.69s/it]
-/home/minyoy/miniconda3/envs/revaudio/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:515: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.9` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`. This was detected when initializing the generation config instance, which means the corresponding file may hold incorrect parameterization and should be fixed.
-  warnings.warn(
-/home/minyoy/miniconda3/envs/revaudio/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:520: UserWarning: `do_sample` is set to `False`. However, `top_p` is set to `0.6` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_p`. This was detected when initializing the generation config instance, which means the corresponding file may hold incorrect parameterization and should be fixed.
-  warnings.warn(
-/home/minyoy/miniconda3/envs/revaudio/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:515: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.9` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
-  warnings.warn(
-/home/minyoy/miniconda3/envs/revaudio/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:520: UserWarning: `do_sample` is set to `False`. However, `top_p` is set to `0.6` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_p`.
-  warnings.warn(
-/home/minyoy/ClipCraft-AI/revisionllm/model/vtimellm_arch.py:69: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
-  mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
-/home/minyoy/ClipCraft-AI/revisionllm/model/vtimellm_arch.py:85: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
-  mm_projector_weights = torch.load(model_args.pretrain_clip_adapter, map_location='cpu')
-/home/minyoy/ClipCraft-AI/revisionllm/model/builder.py:12: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
-  non_lora_trainables = torch.load(non_lora_trainables_path, map_location='cpu')
-/home/minyoy/ClipCraft-AI/revisionllm/data/audio_pipeline/extract_clip.py:85: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at ../torch/csrc/utils/tensor_numpy.cpp:206.)
-  x = torch.from_numpy(frames[b * self.batch_size:(b + 1) * self.batch_size]).to(self.device)
-load mlp: checkpoints/vtimellm-vicuna-v1-5-7b-stage1/mm_projector.bin
-load clip adapter: checkpoints/public/chapters_stage1_sparse/non_lora_trainables.bin
-Loading stage2 weights...
-Loading LoRA weights...
-Merging stage2 weights...
-Loading CLIP models
-[eval] 300 videos / 822 queries available
-[multiquery] video_id=1 features=extracted duration=30.4s
-[multiquery] video_id=1 features=cache hit duration=30.4s
-[multiquery] video_id=1 features=extracted duration=30.4s
-[multiquery] video_id=1 features=cache hit duration=30.4s
-[multiquery] video_id=1 features=extracted duration=27.3s
-[multiquery] video_id=1 features=cache hit duration=27.3s
-video `E6DLK` (duration 27.3s), threshold 0.95
-
-![case](case.png)
-
-| 입력 쿼리 | 처리 | 유사도 | 반환 구간 | GT |
-|---|---|---|---|---|
-| a person sits in a chair. | Grounding 실행 | - | 00:03.82 ~ 00:12.01 | 00:03.10 ~ 00:11.80 |
-| a person sits on a chair. | Cache Hit | 0.983 (→ "a person sits in a chair.") | 00:03.82 ~ 00:12.01 | 00:03.10 ~ 00:11.80 |
-
-exit 0
